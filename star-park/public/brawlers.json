@@ -1,0 +1,557 @@
+[
+  {
+    "name": "Shelly",
+    "key": "shelly",
+    "releaseNumber": 1
+  },
+  {
+    "name": "Colt",
+    "key": "colt",
+    "releaseNumber": 2
+  },
+  {
+    "name": "Bull",
+    "key": "bull",
+    "releaseNumber": 3
+  },
+  {
+    "name": "Brock",
+    "key": "brock",
+    "releaseNumber": 4
+  },
+  {
+    "name": "Rico",
+    "key": "rico",
+    "releaseNumber": 5
+  },
+  {
+    "name": "Spike",
+    "key": "spike",
+    "releaseNumber": 6
+  },
+  {
+    "name": "Barley",
+    "key": "barley",
+    "releaseNumber": 7
+  },
+  {
+    "name": "Jessie",
+    "key": "jessie",
+    "releaseNumber": 8
+  },
+  {
+    "name": "Nita",
+    "key": "nita",
+    "releaseNumber": 9
+  },
+  {
+    "name": "Dynamike",
+    "key": "dynamike",
+    "releaseNumber": 10
+  },
+  {
+    "name": "El Primo",
+    "key": "el-primo",
+    "releaseNumber": 11
+  },
+  {
+    "name": "Mortis",
+    "key": "mortis",
+    "releaseNumber": 12
+  },
+  {
+    "name": "Crow",
+    "key": "crow",
+    "releaseNumber": 13
+  },
+  {
+    "name": "Poco",
+    "key": "poco",
+    "releaseNumber": 14
+  },
+  {
+    "name": "Bo",
+    "key": "bo",
+    "releaseNumber": 15
+  },
+  {
+    "name": "Piper",
+    "key": "piper",
+    "releaseNumber": 16
+  },
+  {
+    "name": "Pam",
+    "key": "pam",
+    "releaseNumber": 17
+  },
+  {
+    "name": "Tara",
+    "key": "tara",
+    "releaseNumber": 18
+  },
+  {
+    "name": "Darryl",
+    "key": "darryl",
+    "releaseNumber": 19
+  },
+  {
+    "name": "Penny",
+    "key": "penny",
+    "releaseNumber": 20
+  },
+  {
+    "name": "Frank",
+    "key": "frank",
+    "releaseNumber": 21
+  },
+  {
+    "name": "Gene",
+    "key": "gene",
+    "releaseNumber": 22
+  },
+  {
+    "name": "Tick",
+    "key": "tick",
+    "releaseNumber": 23
+  },
+  {
+    "name": "Leon",
+    "key": "leon",
+    "releaseNumber": 24
+  },
+  {
+    "name": "Rosa",
+    "key": "rosa",
+    "releaseNumber": 25
+  },
+  {
+    "name": "Carl",
+    "key": "carl",
+    "releaseNumber": 26
+  },
+  {
+    "name": "Bibi",
+    "key": "bibi",
+    "releaseNumber": 27
+  },
+  {
+    "name": "8-Bit",
+    "key": "8-bit",
+    "releaseNumber": 28
+  },
+  {
+    "name": "Sandy",
+    "key": "sandy",
+    "releaseNumber": 29
+  },
+  {
+    "name": "Bea",
+    "key": "bea",
+    "releaseNumber": 30
+  },
+  {
+    "name": "Emz",
+    "key": "emz",
+    "releaseNumber": 31
+  },
+  {
+    "name": "Mr. P",
+    "key": "mr-p",
+    "releaseNumber": 32
+  },
+  {
+    "name": "Max",
+    "key": "max",
+    "releaseNumber": 33
+  },
+  {
+    "name": "Jacky",
+    "key": "jacky",
+    "releaseNumber": 34
+  },
+  {
+    "name": "Gale",
+    "key": "gale",
+    "releaseNumber": 35
+  },
+  {
+    "name": "Nani",
+    "key": "nani",
+    "releaseNumber": 36
+  },
+  {
+    "name": "Sprout",
+    "key": "sprout",
+    "releaseNumber": 37
+  },
+  {
+    "name": "Surge",
+    "key": "surge",
+    "releaseNumber": 38
+  },
+  {
+    "name": "Colette",
+    "key": "colette",
+    "releaseNumber": 39
+  },
+  {
+    "name": "Amber",
+    "key": "amber",
+    "releaseNumber": 40
+  },
+  {
+    "name": "Lou",
+    "key": "lou",
+    "releaseNumber": 41
+  },
+  {
+    "name": "Byron",
+    "key": "byron",
+    "releaseNumber": 42
+  },
+  {
+    "name": "Edgar",
+    "key": "edgar",
+    "releaseNumber": 43
+  },
+  {
+    "name": "Ruffs",
+    "key": "ruffs",
+    "releaseNumber": 44
+  },
+  {
+    "name": "Stu",
+    "key": "stu",
+    "releaseNumber": 45
+  },
+  {
+    "name": "Belle",
+    "key": "belle",
+    "releaseNumber": 46
+  },
+  {
+    "name": "Squeak",
+    "key": "squeak",
+    "releaseNumber": 47
+  },
+  {
+    "name": "Grom",
+    "key": "grom",
+    "releaseNumber": 48
+  },
+  {
+    "name": "Buzz",
+    "key": "buzz",
+    "releaseNumber": 49
+  },
+  {
+    "name": "Griff",
+    "key": "griff",
+    "releaseNumber": 50
+  },
+  {
+    "name": "Ash",
+    "key": "ash",
+    "releaseNumber": 51
+  },
+  {
+    "name": "Meg",
+    "key": "meg",
+    "releaseNumber": 52
+  },
+  {
+    "name": "Lola",
+    "key": "lola",
+    "releaseNumber": 53
+  },
+  {
+    "name": "Fang",
+    "key": "fang",
+    "releaseNumber": 54
+  },
+  {
+    "name": "Eve",
+    "key": "eve",
+    "releaseNumber": 55
+  },
+  {
+    "name": "Janet",
+    "key": "janet",
+    "releaseNumber": 56
+  },
+  {
+    "name": "Bonnie",
+    "key": "bonnie",
+    "releaseNumber": 57
+  },
+  {
+    "name": "Otis",
+    "key": "otis",
+    "releaseNumber": 58
+  },
+  {
+    "name": "Sam",
+    "key": "sam",
+    "releaseNumber": 59
+  },
+  {
+    "name": "Gus",
+    "key": "gus",
+    "releaseNumber": 60
+  },
+  {
+    "name": "Buster",
+    "key": "buster",
+    "releaseNumber": 61
+  },
+  {
+    "name": "Chester",
+    "key": "chester",
+    "releaseNumber": 62
+  },
+  {
+    "name": "Gray",
+    "key": "gray",
+    "releaseNumber": 63
+  },
+  {
+    "name": "Mandy",
+    "key": "mandy",
+    "releaseNumber": 64
+  },
+  {
+    "name": "R-T",
+    "key": "r-t",
+    "releaseNumber": 65
+  },
+  {
+    "name": "Willow",
+    "key": "willow",
+    "releaseNumber": 66
+  },
+  {
+    "name": "Maisie",
+    "key": "maisie",
+    "releaseNumber": 67
+  },
+  {
+    "name": "Hank",
+    "key": "hank",
+    "releaseNumber": 68
+  },
+  {
+    "name": "Cordelius",
+    "key": "cordelius",
+    "releaseNumber": 69
+  },
+  {
+    "name": "Doug",
+    "key": "doug",
+    "releaseNumber": 70
+  },
+  {
+    "name": "Pearl",
+    "key": "pearl",
+    "releaseNumber": 71
+  },
+  {
+    "name": "Chuck",
+    "key": "chuck",
+    "releaseNumber": 72
+  },
+  {
+    "name": "Charlie",
+    "key": "charlie",
+    "releaseNumber": 73
+  },
+  {
+    "name": "Mico",
+    "key": "mico",
+    "releaseNumber": 74
+  },
+  {
+    "name": "Kit",
+    "key": "kit",
+    "releaseNumber": 75
+  },
+  {
+    "name": "Larry & Lawrie",
+    "key": "larry-lawrie",
+    "releaseNumber": 76
+  },
+  {
+    "name": "Melodie",
+    "key": "melodie",
+    "releaseNumber": 77
+  },
+  {
+    "name": "Angelo",
+    "key": "angelo",
+    "releaseNumber": 78
+  },
+  {
+    "name": "Draco",
+    "key": "draco",
+    "releaseNumber": 79
+  },
+  {
+    "name": "Lily",
+    "key": "lily",
+    "releaseNumber": 80
+  },
+  {
+    "name": "Berry",
+    "key": "berry",
+    "releaseNumber": 81
+  },
+  {
+    "name": "Clancy",
+    "key": "clancy",
+    "releaseNumber": 82
+  },
+  {
+    "name": "Moe",
+    "key": "moe",
+    "releaseNumber": 83
+  },
+  {
+    "name": "Kenji",
+    "key": "kenji",
+    "releaseNumber": 84
+  },
+  {
+    "name": "Shade",
+    "key": "shade",
+    "releaseNumber": 85
+  },
+  {
+    "name": "Juju",
+    "key": "juju",
+    "releaseNumber": 86
+  },
+  {
+    "name": "Meeple",
+    "key": "meeple",
+    "releaseNumber": 87
+  },
+  {
+    "name": "Ollie",
+    "key": "ollie",
+    "releaseNumber": 88
+  },
+  {
+    "name": "Lumi",
+    "key": "lumi",
+    "releaseNumber": 89
+  },
+  {
+    "name": "Finx",
+    "key": "finx",
+    "releaseNumber": 90
+  },
+  {
+    "name": "Jae-Yong",
+    "key": "jae-yong",
+    "releaseNumber": 91
+  },
+  {
+    "name": "Kaze",
+    "key": "kaze",
+    "releaseNumber": 92
+  },
+  {
+    "name": "Alli",
+    "key": "alli",
+    "releaseNumber": 93
+  },
+  {
+    "name": "Trunk",
+    "key": "trunk",
+    "releaseNumber": 94
+  },
+  {
+    "name": "Mina",
+    "key": "mina",
+    "releaseNumber": 95
+  },
+  {
+    "name": "Ziggy",
+    "key": "ziggy",
+    "releaseNumber": 96
+  },
+  {
+    "name": "Pierce",
+    "key": "pierce",
+    "releaseNumber": 97
+  },
+  {
+    "name": "Gigi",
+    "key": "gigi",
+    "releaseNumber": 98
+  },
+  {
+    "name": "Glowy",
+    "key": "glowy",
+    "releaseNumber": 99
+  },
+  {
+    "name": "Sirius",
+    "key": "sirius",
+    "releaseNumber": 100
+  },
+  {
+    "name": "Najia",
+    "key": "najia",
+    "releaseNumber": 101
+  },
+  {
+    "name": "Damian",
+    "key": "damian",
+    "releaseNumber": 102
+  },
+  {
+    "name": "Starr Nova",
+    "key": "starr-nova",
+    "releaseNumber": 103
+  },
+  {
+    "name": "Bolt",
+    "key": "bolt",
+    "releaseNumber": 104
+  },
+  {
+    "name": "Nori",
+    "key": "nori",
+    "releaseNumber": 105
+  },
+  {
+    "name": "Wendy",
+    "key": "wendy",
+    "releaseNumber": 106
+  },
+  {
+    "name": "Cosmo",
+    "key": "cosmo",
+    "releaseNumber": 107
+  },
+  {
+    "name": "Vince",
+    "key": "vince",
+    "releaseNumber": 108
+  },
+  {
+    "name": "Thunder Frogs",
+    "key": "thunder-frogs",
+    "releaseNumber": 109
+  },
+  {
+    "name": "Rey",
+    "key": "rey",
+    "releaseNumber": 110
+  },
+  {
+    "name": "Ruby",
+    "key": "ruby",
+    "releaseNumber": 111
+  }
+]

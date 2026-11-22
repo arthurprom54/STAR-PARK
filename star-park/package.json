@@ -1,0 +1,20 @@
+{
+  "name": "star-park-house",
+  "version": "5.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Plataforma comunitária independente para a House STAR PARK.",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "dev": "node --watch --env-file-if-exists=.env server.mjs",
+    "test": "node --test",
+    "migrate:firestore": "node scripts/migrate-json-to-firestore.mjs",
+    "backup:firestore": "node scripts/export-firestore-to-json.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.1"
+  }
+}

@@ -1,0 +1,13 @@
+.env
+node_modules/
+data/
+.DS_Store
+*.log
+
+# Segredos e exportações locais do Firebase
+firebase-service-account*.json
+serviceAccountKey.json
+data/*backup*.json
+data/*export*.json
+*serviceAccount*.json
+*.pem

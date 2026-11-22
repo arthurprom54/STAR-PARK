@@ -1,0 +1,35 @@
+[
+  {
+    "name": "Thunder Frogs",
+    "key": "thunder-frogs",
+    "releaseNumber": 109,
+    "rarity": {"name": "Legendary", "color": "#fff11e"},
+    "class": {"name": "Artillery"},
+    "description": "Um trio de sapos artistas que usa saltos elétricos e pode se unir em uma forma gigante chamada Frogzilla.",
+    "imageUrl2": "https://cdn.brawlhub.gg/assets/brawler-portraits/thunder-frogs.webp",
+    "released": true,
+    "source": "supercell-november-2026-release-notes"
+  },
+  {
+    "name": "Rey",
+    "key": "rey",
+    "releaseNumber": 110,
+    "rarity": {"name": "Mythic", "color": "#fe5e72"},
+    "class": {"name": "Marksman"},
+    "description": "O rei de Toyland marca os adversários e fortalece seus disparos enquanto luta ao lado de Ruby.",
+    "imageUrl2": "https://cdn.brawlhub.gg/assets/brawler-portraits/rey.webp",
+    "released": true,
+    "source": "supercell-november-2026-release-notes"
+  },
+  {
+    "name": "Ruby",
+    "key": "ruby",
+    "releaseNumber": 111,
+    "rarity": {"name": "Mythic", "color": "#fe5e72"},
+    "class": {"name": "Damage Dealer"},
+    "description": "A rainha de Toyland usa cartas em ataques especiais e tem uma habilidade de sinergia com Rey.",
+    "imageUrl2": "https://cdn.brawlhub.gg/assets/brawler-portraits/ruby.webp",
+    "released": true,
+    "source": "supercell-november-2026-release-notes"
+  }
+]
