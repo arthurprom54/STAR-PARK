@@ -1,0 +1,187 @@
+name: Diagnostico API Supercell
+
+on:
+  workflow_dispatch:
+    inputs:
+      player_tag:
+        description: "Tag de um jogador cadastrado no Star Park (opcional, com ou sem #)"
+        required: false
+        type: string
+        default: ""
+      api_base:
+        description: "Base da API (mantenha o proxy recomendado)"
+        required: true
+        type: choice
+        options:
+          - https://bsproxy.royaleapi.dev/v1
+          - https://api.brawlstars.com/v1
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostico:
+    name: Testar autenticação e endpoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Diagnosticar API Brawl Stars
+        env:
+          API_TOKEN: ${{ secrets.BRAWL_STARS_API_TOKEN }}
+          API_BASE: ${{ inputs.api_base }}
+          PLAYER_TAG: ${{ inputs.player_tag }}
+          STAR_PARK_URL: https://star-park.onrender.com
+        run: |
+          node --input-type=module <<'NODE'
+          import { setTimeout as sleep } from 'node:timers/promises';
+
+          const token = String(process.env.API_TOKEN || '').trim().replace(/^Bearer\s+/i, '');
+          const base = String(process.env.API_BASE || '').trim().replace(/\/+$/, '');
+          const rawTag = String(process.env.PLAYER_TAG || '').trim();
+          const tag = rawTag.replace(/^#/, '').replace(/\s+/g, '').toUpperCase();
+
+          function safe(value) {
+            return String(value ?? '')
+              .replaceAll(token, '[CHAVE OCULTA]')
+              .replace(/(Bearer\s+)[A-Za-z0-9._~-]+/gi, '$1[CHAVE OCULTA]')
+              .slice(0, 1800);
+          }
+
+          function report(label, data) {
+            console.log(`\n========== ${label} ==========`);
+            console.log(typeof data === 'string' ? safe(data) : JSON.stringify(data, null, 2));
+          }
+
+          if (!token) {
+            report('FALHA DE CONFIGURAÇÃO', {
+              erro: 'O segredo BRAWL_STARS_API_TOKEN não foi encontrado no GitHub Actions.',
+              como_corrigir: 'No GitHub: Settings > Secrets and variables > Actions > New repository secret. Nome exato: BRAWL_STARS_API_TOKEN. Cole a chave oficial da Supercell no campo Secret. Nunca coloque a chave no código ou no chat.'
+            });
+            process.exit(2);
+          }
+
+          if (!/^https:\/\/[a-z0-9.-]+\/v1$/i.test(base)) {
+            report('FALHA DE CONFIGURAÇÃO', { erro: 'API_BASE inválida. Use uma URL HTTPS terminada em /v1.' });
+            process.exit(2);
+          }
+
+          report('CONFIGURAÇÃO', {
+            base: new URL(base).origin,
+            tokenEncontrado: true,
+            tokenEnviadoComo: 'Authorization: Bearer [OCULTO]',
+            tagInformada: Boolean(tag),
+            tagFormatoBasicoValido: tag ? /^[0289PYLQGRJCUV]{3,15}$/.test(tag) : null
+          });
+
+          async function request(path, label) {
+            const url = `${base}${path}`;
+            const started = Date.now();
+            let response;
+            let bodyText = '';
+            try {
+              response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Accept: 'application/json',
+                  'User-Agent': 'StarPark-Supercell-Diagnostic/1.0'
+                },
+                signal: AbortSignal.timeout(20000),
+                cache: 'no-store'
+              });
+              bodyText = await response.text();
+              let parsed;
+              try { parsed = JSON.parse(bodyText); } catch { parsed = bodyText; }
+
+              const headers = {};
+              for (const name of ['content-type', 'server', 'via', 'retry-after', 'x-request-id', 'cf-ray', 'date']) {
+                const value = response.headers.get(name);
+                if (value) headers[name] = value;
+              }
+
+              report(label, {
+                url,
+                status: response.status,
+                statusText: response.statusText,
+                tempoMs: Date.now() - started,
+                headers,
+                resposta: parsed
+              });
+              return { ok: response.ok, status: response.status, body: parsed };
+            } catch (error) {
+              report(label, {
+                url,
+                erro: error?.name || 'Erro',
+                mensagem: safe(error?.message || error),
+                tempoMs: Date.now() - started,
+                diagnostico: 'Falha de rede, DNS, TLS ou timeout antes de receber resposta HTTP.'
+              });
+              return { ok: false, status: 0, body: String(error) };
+            }
+          }
+
+          async function checkStarPark() {
+            try {
+              const response = await fetch(`${process.env.STAR_PARK_URL}/api/health`, {
+                headers: { Accept: 'application/json' },
+                signal: AbortSignal.timeout(15000),
+                cache: 'no-store'
+              });
+              const body = await response.json().catch(() => ({}));
+              report('SAÚDE DO STAR PARK NO RENDER', {
+                status: response.status,
+                appOk: body.ok ?? null,
+                appVersion: body.appVersion ?? null,
+                apiConfigured: body.apiConfigured ?? null,
+                playerSync: body.playerSync ?? null
+              });
+            } catch (error) {
+              report('SAÚDE DO STAR PARK NO RENDER', {
+                erro: safe(error?.message || error),
+                diagnostico: 'O GitHub Actions não conseguiu consultar o endpoint público do Star Park.'
+              });
+            }
+          }
+
+          await checkStarPark();
+
+          // Endpoint leve para validar autenticação e conectividade com a API.
+          const catalog = await request('/brawlers', 'TESTE PRINCIPAL: GET /brawlers');
+
+          if (tag) {
+            if (!/^[0289PYLQGRJCUV]{3,15}$/.test(tag)) {
+              report('TAG DO JOGADOR', {
+                erro: 'Formato de tag inválido. Confira a tag no jogo ou no Star Park.'
+              });
+              process.exit(3);
+            }
+            await sleep(1200);
+            const player = await request(`/players/%23${encodeURIComponent(tag)}`, 'TESTE DO PERFIL: GET /players/{tag}');
+            if (player.ok) {
+              await sleep(1200);
+              await request(`/players/%23${encodeURIComponent(tag)}/battlelog`, 'TESTE DO HISTÓRICO: GET /players/{tag}/battlelog');
+            }
+          }
+
+          if (catalog.ok) {
+            report('RESULTADO', {
+              conclusao: 'A chave foi aceita pelo endpoint de catálogo através desta rota.',
+              observacao: tag ? 'Consulte também o teste do perfil para confirmar a tag e a permissão desse recurso.' : 'Para testar também o perfil real, execute novamente informando uma tag válida.'
+            });
+          } else {
+            const meaning = {
+              400: 'A API recebeu a solicitação, mas rejeitou algum parâmetro ou formato.',
+              401: 'Credencial ausente, inválida, revogada ou enviada no formato incorreto.',
+              403: 'Acesso proibido. Pode ser restrição de IP/chave, política do proxy ou permissão do recurso. O corpo e os cabeçalhos acima são a evidência principal.',
+              404: 'Rota/recurso não encontrado. Confira a base e o caminho usados.',
+              429: 'Limite de consultas atingido. Respeite Retry-After e aguarde.',
+              0: 'Falha de rede/DNS/TLS/timeout; nenhuma resposta HTTP chegou.'
+            };
+            report('RESULTADO', {
+              conclusao: 'A chamada de validação falhou.',
+              significadoProvavel: meaning[catalog.status] || `Resposta HTTP ${catalog.status}.`,
+              proximoPasso: 'Use o status, cabeçalhos e corpo acima para identificar se a falha veio do proxy ou da API upstream. A chave foi ocultada dos logs.'
+            });
+            process.exit(1);
+          }
+          NODE
