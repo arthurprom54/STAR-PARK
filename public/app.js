@@ -261,6 +261,87 @@ phoneField?.addEventListener('input',()=>{const formatted=formatPhoneField(phone
 phoneField?.addEventListener('blur',()=>{phoneField.value=formatPhoneField(phoneField.value);});
 $('#applicationForm').addEventListener('submit',async e=>{e.preventDefault();const form=e.currentTarget;if(!form.reportValidity())return;const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;const btn=$('#submitApplication');btn.disabled=true;setFeedback('#applicationFeedback','Enviando sua candidatura com segurança…');try{const r=await api('/api/applications',{method:'POST',body:JSON.stringify(body)});form.reset();setFeedback('#applicationFeedback',`Candidatura recebida! Protocolo ${r.applicationId.slice(0,8).toUpperCase()}. A equipe fará a análise.`);toast('Candidatura enviada.');await loadPublic();}catch(err){setFeedback('#applicationFeedback',err.message,true);}finally{btn.disabled=false;}});
 function updateRecruitFormState(){api('/api/public/settings').then(updateRecruitSettings).catch(()=>{});}
+
+/* STAR_PARK_MEMBER_BRAWLER_CARDS_V1 */
+let memberBrawlersCache = [];
+
+function memberBrawlerCardMarkup(b) {
+  const catalog = roster.find(x => slugKey(x.name) === slugKey(b.name));
+  const image = catalog ? brawlerImageMarkup(catalog, 'member-brawler-character') :
+    '<span class="member-brawler-fallback">' + esc(initials(b.name)) + '</span>';
+  const rank = b.rank == null ? '—' : String(b.rank);
+  const trophies = b.trophies == null ? '—' : fmt(b.trophies);
+  const power = b.power == null ? '—' : String(b.power);
+  const highest = b.highestTrophies == null ? '—' : fmt(b.highestTrophies);
+  const rarity = catalog?.rarity || 'BRAWLER';
+  const [c1,c2] = brawlerColor(catalog?.id || b.name?.length || 1);
+  const progression = Number.isFinite(Number(b.trophies)) && Number.isFinite(Number(b.highestTrophies)) &&
+    Number(b.highestTrophies) > 0
+    ? Math.max(0, Math.min(100, Math.round(Number(b.trophies) / Number(b.highestTrophies) * 100)))
+    : null;
+  const equipment = [
+    Array.isArray(b.gadgets) ? b.gadgets.length : null,
+    Array.isArray(b.starPowers) ? b.starPowers.length : null,
+    Array.isArray(b.gears) ? b.gears.length : null
+  ].filter(x => x !== null).reduce((sum,x) => sum + x, 0);
+  return `<article class="member-brawler-card" style="--member-card-a:${c1};--member-card-b:${c2}">
+    <div class="member-brawler-art">${image}<span class="member-brawler-rarity">${esc(rarity)}</span></div>
+    <div class="member-brawler-info">
+      <div class="member-brawler-title"><b>${esc(b.name || 'Brawler')}</b><span>RANK ${esc(rank)}</span></div>
+      <div class="member-brawler-stats">
+        <span><small>TROFÉUS</small><strong>${trophies}</strong></span>
+        <span><small>PODER</small><strong>${esc(power)}</strong></span>
+        <span><small>RECORDE</small><strong>${highest}</strong></span>
+      </div>
+      ${progression === null ? '' : `<div class="member-brawler-progress"><span style="width:${progression}%"></span></div><small class="member-brawler-progress-label">${progression}% do recorde pessoal</small>`}
+      <div class="member-brawler-foot"><span>${equipment ? `✦ ${equipment} melhoria(s) informada(s)` : 'Coleção oficial'}</span><span>${catalog?.class ? esc(catalog.class) : 'Brawl Stars'}</span></div>
+    </div>
+  </article>`;
+}
+
+function memberBrawlerCardsMarkup(items) {
+  memberBrawlersCache = Array.isArray(items) ? items.slice() : [];
+  return `<section class="game-panel member-brawler-collection">
+    <div class="panel-head"><div><span class="kicker">COLEÇÃO DO JOGADOR</span><h3>Meus Brawlers</h3></div><span class="count-bubble">${fmt(memberBrawlersCache.length)}</span></div>
+    <div class="member-brawler-toolbar">
+      <label class="search-control"><span>⌕</span><input id="memberBrawlerSearch" type="search" placeholder="Buscar Brawler..." aria-label="Buscar Brawler na coleção"></label>
+      <select id="memberBrawlerSort" aria-label="Ordenar coleção">
+        <option value="trophies">Mais troféus</option>
+        <option value="rank">Maior rank</option>
+        <option value="power">Maior poder</option>
+        <option value="name">Nome A–Z</option>
+      </select>
+    </div>
+    <div id="memberBrawlerGrid" class="member-brawler-grid">
+      ${memberBrawlersCache.length ? memberBrawlersCache.slice().sort((a,b)=>(Number(b.trophies)||0)-(Number(a.trophies)||0)).map(memberBrawlerCardMarkup).join('') : '<div class="empty-box">Aguarde a primeira consulta oficial do perfil.</div>'}
+    </div>
+    <p class="footnote">Troféus, poder, rank e recordes são exibidos conforme os campos realmente retornados pelo perfil oficial. Campos ausentes permanecem como indisponíveis.</p>
+  </section>`;
+}
+
+function renderMemberBrawlerCards() {
+  const host = document.querySelector('#memberBrawlerGrid');
+  if (!host) return;
+  const term = (document.querySelector('#memberBrawlerSearch')?.value || '').trim().toLocaleLowerCase('pt-BR');
+  const sort = document.querySelector('#memberBrawlerSort')?.value || 'trophies';
+  const list = memberBrawlersCache.filter(b => String(b.name || '').toLocaleLowerCase('pt-BR').includes(term));
+  list.sort((a,b) => {
+    if (sort === 'name') return String(a.name || '').localeCompare(String(b.name || ''), 'pt-BR');
+    const field = sort === 'rank' ? 'rank' : sort === 'power' ? 'power' : 'trophies';
+    return (Number(b[field]) || -1) - (Number(a[field]) || -1);
+  });
+  host.innerHTML = list.length
+    ? list.map(memberBrawlerCardMarkup).join('')
+    : '<div class="empty-box" style="grid-column:1/-1">Nenhum Brawler encontrado com esse filtro.</div>';
+}
+
+document.addEventListener('input', event => {
+  if (event.target?.id === 'memberBrawlerSearch') renderMemberBrawlerCards();
+});
+document.addEventListener('change', event => {
+  if (event.target?.id === 'memberBrawlerSort') renderMemberBrawlerCards();
+});
+
 async function loadMemberPortal(){
  if(!auth.user||auth.user.role!=='MEMBER')return;
  try{
@@ -293,7 +374,7 @@ async function loadMemberPortal(){
    <article class="metric-card"><div class="metric-top"><span>NÍVEL</span><b>★</b></div><strong>${fmt(stats.experienceLevel)}</strong><small>${fmt(stats.experiencePoints)} XP</small></article>
    <article class="metric-card"><div class="metric-top"><span>BRAWLERS</span><b>♟</b></div><strong>${fmt(stats.brawlerCount)}</strong><small>Desbloqueados</small></article>
    <article class="metric-card"><div class="metric-top"><span>PARTIDAS OBSERVADAS</span><b>🎮</b></div><strong>${fmt(battle.totalObserved||0)}</strong><small>Desde a coleta do Star Park</small></article>
-   <div class="game-panel" style="grid-column:1/-1"><div class="panel-head"><div><span class="kicker">COLEÇÃO</span><h3>Meus Brawlers</h3></div><span class="count-bubble">${fmt((m.brawlers||[]).length)}</span></div><div class="admin-list compact-list">${(m.brawlers||[]).slice().sort((a,b)=>(b.trophies||0)-(a.trophies||0)).slice(0,30).map(b=>`<article class="admin-row"><div class="admin-row-main"><b>${esc(b.name)}</b><small>${fmt(b.trophies)} troféus · Poder ${fmt(b.power)} · Recorde ${fmt(b.highestTrophies)}</small></div><span class="status-tag">${esc(b.rank==null?'—':`Rank ${b.rank}`)}</span></article>`).join('')||'<div class="empty-box">Aguarde a primeira consulta oficial do perfil.</div>'}</div></div>
+   ${memberBrawlerCardsMarkup(m.brawlers||[])}
    <div class="game-panel" style="grid-column:1/-1"><div class="panel-head"><div><span class="kicker">BATALHAS CAPTURADAS</span><h3>Últimas partidas observadas</h3></div><span class="count-bubble">${fmt((m.recentBattleHistory||[]).length)}</span></div><div class="admin-list compact-list">${(m.recentBattleHistory||[]).map(b=>`<article class="admin-row"><div class="admin-row-main"><b>${esc(b.brawlerName)} · ${esc(b.mode||'Modo não informado')}</b><small>${esc(b.map||'Mapa não informado')} · ${esc(b.result||'Resultado indisponível')} · ${dateTime(b.battleTime||b.observedAt)}</small></div><span class="status-tag">${b.trophyChange==null?'':`${b.trophyChange>0?'+':''}${b.trophyChange} troféus`}</span></article>`).join('')||'<div class="empty-box">A API ainda não forneceu partidas para registrar.</div>'}</div><p class="footnote">A API oficial disponibiliza um Battle Log recente, não um histórico vitalício. O Star Park guarda apenas partidas que conseguiu observar após a ativação da coleta.</p></div>`;
   const eventsHtml=(r.events||[]).map(e=>`${eventMarkup(e)}<button class="mini-action primary" data-register-event="${esc(e.id)}">INSCREVER-SE</button>`).join('');
   $('#memberEventContent').innerHTML=eventsHtml||'<div class="empty-box">Nenhum evento publicado.</div>';
