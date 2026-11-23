@@ -31,7 +31,7 @@ jobs:
 
       - name: Abrir e atualizar arquivos
         run: |
-          ZIP="star-park-v5.0.1-candidatura-corrigida.zip"
+          ZIP="star-park-v5.0.1-candidatura-corrigida(1).zip"
           TEMP="$RUNNER_TEMP/star-park"
 
           if [ ! -f "$ZIP" ]; then
