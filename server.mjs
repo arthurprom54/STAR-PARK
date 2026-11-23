@@ -10,7 +10,7 @@ import {aggregateBattleStats, extractBattleRecords, normalizePlayerStats} from '
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const APP_VERSION = '5.0.2';
 const PORT = Number(process.env.PORT || 4173);
-const API_BASE = 'https://api.brawlstars.com/v1';
+const API_BASE = (process.env.BRAWL_STARS_API_BASE || 'https://bsproxy.royaleapi.dev/v1').replace(/\/+$/, '');
 const CATALOG_API_URL = process.env.BRAWL_CATALOG_API_URL || 'https://api.brawlapi.com/v1/brawlers';
 const API_TOKEN = process.env.BRAWL_STARS_API_TOKEN || '';
 const SESSION_SECRET = process.env.STAR_PARK_SESSION_SECRET || '';
