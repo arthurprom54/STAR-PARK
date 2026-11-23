@@ -1,0 +1,338 @@
+name: Instalar Protecao Anti-Falhas da API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  install-api-resilience:
+    name: Corrigir API, testar e publicar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Baixar o codigo atual do Star Park
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar dependencias de teste
+        run: npm install --no-package-lock --ignore-scripts --no-audit --no-fund
+
+      - name: Instalar protecao resiliente sem sobrescrever outras partes do site
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs/promises';
+
+          const file = 'server.mjs';
+          let source = await fs.readFile(file, 'utf8');
+
+          const marker = '/* STAR_PARK_API_RESILIENCE_V1 */';
+          if (source.includes(marker)) {
+            console.log('A protecao V1 ja esta instalada. Nenhuma alteracao duplicada foi feita.');
+            process.exit(0);
+          }
+
+          const tokenLine = "const API_TOKEN = process.env.BRAWL_STARS_API_TOKEN || '';";
+          if (!source.includes(tokenLine)) {
+            throw new Error('Nao encontrei a declaracao esperada de BRAWL_STARS_API_TOKEN. Nenhum arquivo foi alterado.');
+          }
+          source = source.replace(tokenLine, [
+            "const API_TOKEN_RAW = String(process.env.BRAWL_STARS_API_TOKEN || '').trim();",
+            "const API_TOKEN = API_TOKEN_RAW.replace(/^Bearer\\s+/i, '').replace(/^\"(.*)\"$/, '$1').replace(/^'(.*)'$/, '$1').trim();",
+            'const API_TOKEN_VALID = API_TOKEN.length > 0 && !/\\s/.test(API_TOKEN);'
+          ].join('\n'));
+
+          const cooldownAnchor = "let apiCooldownMessage = 'Aguardando a liberacao do limite de consultas da API oficial.';";
+          const cooldownAnchorAccent = "let apiCooldownMessage = 'Aguardando a liberação do limite de consultas da API oficial.';";
+          const chosenCooldownAnchor = source.includes(cooldownAnchorAccent) ? cooldownAnchorAccent : cooldownAnchor;
+          if (!source.includes(chosenCooldownAnchor)) {
+            throw new Error('Nao encontrei o ponto seguro para registrar o estado do diagnostico. Nenhum arquivo foi alterado.');
+          }
+          source = source.replace(chosenCooldownAnchor, chosenCooldownAnchor + [
+            'let lastOfficialApiDiagnostic = null;',
+            'let lastOfficialApiSuccessAt = null;',
+            'let lastOfficialApiFailureAt = null;',
+            'let officialApiFailureCount = 0;'
+          ].join('\n'));
+
+          const start = source.indexOf('async function officialFetch(endpoint){');
+          const end = source.indexOf('async function fetchAllBrawlers', start);
+          if (start < 0 || end < 0 || end <= start) {
+            throw new Error('Nao encontrei o bloco oficial de requisicoes da API. Nenhum arquivo foi alterado.');
+          }
+
+          const replacement = String.raw`/* STAR_PARK_API_RESILIENCE_V1 */
+          async function officialFetch(endpoint, options = {}) {
+            const {bypassCooldown = false} = options;
+            if (!API_TOKEN) throw httpError(503, 'A chave BRAWL_STARS_API_TOKEN nao foi configurada no servidor.');
+            if (!API_TOKEN_VALID) {
+              const message = 'A chave BRAWL_STARS_API_TOKEN contem espacos ou quebras de linha no meio do valor. Cole somente a chave, sem Bearer, aspas ou espacos internos.';
+              const error = httpError(500, message);
+              error.code = 'API_TOKEN_MALFORMED';
+              error.diagnostic = {stage: 'configuration', code: error.code, message, at: nowISO()};
+              lastOfficialApiDiagnostic = error.diagnostic;
+              lastOfficialApiFailureAt = nowISO();
+              officialApiFailureCount++;
+              apiCooldownStatus = 500;
+              apiCooldownMessage = message;
+              apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + 300000);
+              throw error;
+            }
+
+            let targetUrl;
+            try {
+              const base = new URL(API_BASE);
+              if (base.protocol !== 'https:' || base.username || base.password) throw new Error('A URL base precisa usar HTTPS e nao pode conter credenciais.');
+              const path = String(endpoint || '');
+              if (!path.startsWith('/') || path.startsWith('//') || /[\r\n]/.test(path)) throw new Error('Caminho de endpoint invalido.');
+              const basePath = base.pathname.replace(/\/+$/, '');
+              targetUrl = new URL(basePath + path, base.origin);
+              if (targetUrl.origin !== base.origin) throw new Error('O endpoint tentou sair do host configurado.');
+            } catch (cause) {
+              const error = httpError(500, 'Configuracao da URL da API invalida: ' + (cause?.message || 'URL invalida.'));
+              error.code = 'API_BASE_INVALID';
+              error.diagnostic = {stage: 'configuration', code: error.code, message: error.message, at: nowISO()};
+              lastOfficialApiDiagnostic = error.diagnostic;
+              lastOfficialApiFailureAt = nowISO();
+              officialApiFailureCount++;
+              apiCooldownStatus = 500;
+              apiCooldownMessage = error.message;
+              apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + 300000);
+              throw error;
+            }
+
+            const request = officialApiQueue.then(async () => {
+              if (!bypassCooldown && Date.now() < apiCooldownUntil) {
+                const error = httpError(apiCooldownStatus || 429, apiCooldownMessage || 'A API esta em pausa de protecao.');
+                error.code = 'API_COOLDOWN';
+                error.diagnostic = lastOfficialApiDiagnostic;
+                throw error;
+              }
+
+              const retryableStatuses = new Set([408, 425, 500, 502, 503, 504]);
+              const maxRetries = 2;
+              for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                if (!bypassCooldown && Date.now() < apiCooldownUntil) {
+                  const error = httpError(apiCooldownStatus || 429, apiCooldownMessage || 'A API esta em pausa de protecao.');
+                  error.code = 'API_COOLDOWN';
+                  error.diagnostic = lastOfficialApiDiagnostic;
+                  throw error;
+                }
+
+                const wait = Math.max(0, nextOfficialApiRequestAt - Date.now());
+                if (wait) await sleep(wait);
+                nextOfficialApiRequestAt = Date.now() + API_MIN_REQUEST_INTERVAL_MS;
+
+                let response;
+                try {
+                  response = await fetch(targetUrl, {
+                    method: 'GET',
+                    headers: {
+                      Authorization: 'Bearer ' + API_TOKEN,
+                      Accept: 'application/json',
+                      'User-Agent': 'StarPark/5.0.2 API-Resilience'
+                    },
+                    signal: AbortSignal.timeout(15000),
+                    cache: 'no-store'
+                  });
+                } catch (cause) {
+                  const networkMessage = cause?.name === 'TimeoutError' || cause?.name === 'AbortError'
+                    ? 'A API excedeu o tempo limite de 15 segundos.'
+                    : 'Falha de rede ao conectar com a API: ' + String(cause?.message || cause || 'erro desconhecido').slice(0, 300);
+                  if (attempt < maxRetries) {
+                    await sleep(500 * (attempt + 1));
+                    continue;
+                  }
+                  const diagnostic = {
+                    stage: 'network', code: cause?.code || cause?.name || 'NETWORK_ERROR',
+                    endpoint: targetUrl.pathname + targetUrl.search, message: networkMessage,
+                    attempts: attempt + 1, at: nowISO()
+                  };
+                  lastOfficialApiDiagnostic = diagnostic;
+                  lastOfficialApiFailureAt = nowISO();
+                  officialApiFailureCount++;
+                  apiCooldownStatus = 503;
+                  apiCooldownMessage = networkMessage;
+                  apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + 30000);
+                  const error = httpError(503, networkMessage + ' O sistema tentou novamente ' + (attempt + 1) + ' vez(es).');
+                  error.code = diagnostic.code;
+                  error.diagnostic = diagnostic;
+                  throw error;
+                }
+
+                const rawBody = await response.text().catch(() => '');
+                let payload = null;
+                let validJson = false;
+                try { payload = rawBody ? JSON.parse(rawBody) : null; validJson = true; } catch {}
+
+                if (response.ok) {
+                  if (!validJson) {
+                    const diagnostic = {
+                      stage: 'response', code: 'INVALID_JSON', status: response.status,
+                      endpoint: targetUrl.pathname + targetUrl.search,
+                      contentType: response.headers.get('content-type'),
+                      responseBody: rawBody.replaceAll(API_TOKEN, '[SEGREDO_OCULTO]').slice(0, 1800),
+                      at: nowISO()
+                    };
+                    lastOfficialApiDiagnostic = diagnostic;
+                    lastOfficialApiFailureAt = nowISO();
+                    officialApiFailureCount++;
+                    apiCooldownStatus = 502;
+                    apiCooldownMessage = 'A API enviou uma resposta que nao e JSON valido.';
+                    apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + 30000);
+                    const error = httpError(502, 'A API respondeu com sucesso HTTP, mas enviou um corpo que nao e JSON valido.');
+                    error.code = 'INVALID_JSON'; error.diagnostic = diagnostic;
+                    throw error;
+                  }
+                  lastOfficialApiSuccessAt = nowISO();
+                  officialApiFailureCount = 0;
+                  apiCooldownUntil = 0;
+                  apiCooldownStatus = 429;
+                  apiCooldownMessage = 'Aguardando a liberacao do limite de consultas da API oficial.';
+                  return payload;
+                }
+
+                const upstreamMessage = typeof payload?.message === 'string' ? payload.message.slice(0, 300)
+                  : typeof payload?.error === 'string' ? payload.error.slice(0, 300) : '';
+                const upstreamReason = typeof payload?.reason === 'string' ? payload.reason.slice(0, 120)
+                  : typeof payload?.code === 'string' ? payload.code.slice(0, 120) : '';
+                const redactedBody = rawBody.replaceAll(API_TOKEN, '[SEGREDO_OCULTO]').slice(0, 1800);
+                const diagnostic = {
+                  stage: 'upstream', status: response.status, statusText: response.statusText,
+                  endpoint: targetUrl.pathname + targetUrl.search,
+                  reason: upstreamReason || null, message: upstreamMessage || null,
+                  headers: {
+                    contentType: response.headers.get('content-type'),
+                    server: response.headers.get('server'),
+                    cfRay: response.headers.get('cf-ray'),
+                    requestId: response.headers.get('x-request-id') || response.headers.get('x-correlation-id'),
+                    retryAfter: response.headers.get('retry-after'),
+                    date: response.headers.get('date')
+                  },
+                  responseBody: redactedBody || null, attempts: attempt + 1, at: nowISO()
+                };
+
+                if (retryableStatuses.has(response.status) && attempt < maxRetries) {
+                  await sleep(500 * (attempt + 1));
+                  continue;
+                }
+
+                const messages = {
+                  400: 'A API rejeitou os parametros enviados.',
+                  401: 'A API recusou a chave de autenticacao (HTTP 401).',
+                  403: /invalid authorization/i.test(upstreamMessage)
+                    ? 'A API/proxy recusou a autorizacao (HTTP 403: Invalid authorization). Isso nao e erro da tag do jogador. Verifique se a chave foi copiada sem espacos internos e se o IP de saida permitido corresponde ao servico que faz a chamada.'
+                    : 'A API negou o acesso (HTTP 403). Verifique a chave, o escopo e o IP permitido.',
+                  404: 'Jogador ou recurso nao encontrado (HTTP 404).',
+                  429: 'A API atingiu o limite de consultas (HTTP 429).',
+                  500: 'A API apresentou erro interno (HTTP 500).',
+                  502: 'O gateway/proxy recebeu uma resposta invalida (HTTP 502).',
+                  503: 'A API esta temporariamente indisponivel (HTTP 503).',
+                  504: 'O gateway/proxy excedeu o tempo limite (HTTP 504).'
+                };
+                const baseMessage = messages[response.status] || ('A API respondeu com HTTP ' + response.status + '.');
+                const detail = [upstreamReason, upstreamMessage].filter(Boolean).join(' / ');
+                const message = baseMessage + (detail ? ' Detalhe informado pelo servidor: ' + detail : '');
+                lastOfficialApiDiagnostic = diagnostic;
+                lastOfficialApiFailureAt = nowISO();
+                officialApiFailureCount++;
+
+                if ([401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
+                  const retryHeader = response.headers.get('retry-after');
+                  const retryMs = retryHeader
+                    ? (/^\d+$/.test(retryHeader) ? Number(retryHeader) * 1000 : Math.max(0, Date.parse(retryHeader) - Date.now()))
+                    : 0;
+                  const fallbackMs = response.status === 429 ? 60000 : [401, 403].includes(response.status) ? 300000 : 30000;
+                  const cooldownMs = Math.max(30000, Math.min(retryMs || fallbackMs, 900000));
+                  apiCooldownStatus = response.status;
+                  apiCooldownMessage = message;
+                  apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + cooldownMs);
+                  diagnostic.cooldownUntil = new Date(apiCooldownUntil).toISOString();
+                }
+
+                const error = httpError(response.status, message);
+                error.code = upstreamReason || ('HTTP_' + response.status);
+                error.diagnostic = diagnostic;
+                throw error;
+              }
+              throw httpError(503, 'A API nao respondeu apos as tentativas de recuperacao.');
+            });
+            officialApiQueue = request.catch(() => {});
+            return request;
+          }
+          `;
+
+          source = source.slice(0, start) + replacement + source.slice(end);
+
+          source = source.replaceAll('Boolean(API_TOKEN)', 'API_TOKEN_VALID');
+          source = source.replaceAll('if(!API_TOKEN)', 'if(!API_TOKEN_VALID)');
+          source = source.replaceAll('if(API_TOKEN)', 'if(API_TOKEN_VALID)');
+
+          const userAnchor = '    const user=currentUser(req);';
+          if (!source.includes(userAnchor)) {
+            throw new Error('Nao encontrei o ponto seguro para adicionar a rota administrativa de diagnostico. Nenhum arquivo foi salvo.');
+          }
+          const diagnosticRoute = String.raw`
+              if(req.method==='GET'&&url.pathname==='/api/admin/api-diagnostics'){
+                requirePermission(user,'api.sync');
+                const checkedAt=nowISO();
+                let safeBase='URL invalida';
+                try{const parsedBase=new URL(API_BASE);safeBase=parsedBase.origin+parsedBase.pathname;}catch{}
+                try{
+                  const payload=await officialFetch('/brawlers?limit=1',{bypassCooldown:true});
+                  const items=Array.isArray(payload?.items)?payload.items:Array.isArray(payload?.list)?payload.list:Array.isArray(payload?.brawlers)?payload.brawlers:Array.isArray(payload)?payload:[];
+                  return sendJSON(res,200,{ok:true,checkedAt,base:safeBase,status:200,returnedItems:items.length,lastSuccessAt:lastOfficialApiSuccessAt,lastFailureAt:lastOfficialApiFailureAt,consecutiveFailures:officialApiFailureCount});
+                }catch(error){
+                  return sendJSON(res,502,{ok:false,checkedAt,base:safeBase,configured:API_TOKEN_VALID,error:fmtError(error),diagnostic:error.diagnostic||lastOfficialApiDiagnostic,cooldownUntil:apiCooldownUntil?new Date(apiCooldownUntil).toISOString():null});
+                }
+              }
+          `;
+          source = source.replace(userAnchor, userAnchor + diagnosticRoute);
+
+          await fs.writeFile(file, source, 'utf8');
+          console.log('Protecao instalada: normalizacao de chave, validacao de configuracao, timeout, retry seletivo, cooldown, redacao do segredo e diagnostico autenticado.');
+          NODE
+
+      - name: Validar sintaxe do servidor
+        run: node --check server.mjs
+
+      - name: Executar todos os testes do projeto
+        run: npm test
+
+      - name: Verificar alteracoes
+        run: git diff --check
+
+      - name: Publicar correcao no GitHub
+        shell: bash
+        run: |
+          if git diff --quiet -- server.mjs; then
+            echo "Nenhuma alteracao nova: a protecao ja estava instalada."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.mjs
+          git commit -m "Add resilient Supercell API diagnostics and recovery"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Resumo da execucao
+        if: always()
+        run: |
+          {
+            echo "## Protecao da API Star Park"
+            echo "- A chave nunca e exibida nos logs."
+            echo "- Erros 401/403 nao sao repetidos sem sentido; ficam explicados no diagnostico."
+            echo "- Falhas temporarias de rede e HTTP 5xx recebem ate duas novas tentativas."
+            echo "- A API recebe timeout, fila e intervalo minimo entre chamadas."
+            echo "- Nova rota administrativa: GET /api/admin/api-diagnostics (permissao api.sync)."
+            echo "- O deploy automatico do Render pode iniciar depois do commit em main."
+          } >> "$GITHUB_STEP_SUMMARY"
