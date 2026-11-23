@@ -14,7 +14,7 @@ async function waitForServer(){for(let i=0;i<60;i++){try{const r=await fetch(`${
 before(async()=>{const port=await freePort();base=`http://127.0.0.1:${port}`;tempData=await fs.mkdtemp(path.join(os.tmpdir(),'starpark-test-'));child=spawn(process.execPath,['server.mjs'],{cwd:ROOT,env:{...process.env,PORT:String(port),STAR_PARK_DATA_DIR:tempData,BRAWL_STARS_API_TOKEN:'',STAR_PARK_OWNER_EMAIL:'',STAR_PARK_OWNER_PASSWORD:'',STAR_PARK_SESSION_SECRET:'',STAR_PARK_DISABLE_CATALOG_SYNC:'1',STAR_PARK_RECRUITMENT_OPEN_ON_BOOT:'true'},stdio:'ignore'});await waitForServer();});
 after(async()=>{if(child&&!child.killed)child.kill('SIGTERM');if(tempData)await fs.rm(tempData,{recursive:true,force:true});});
 
-test('servidor inicia com catálogo inicial e API explicitamente desativada',async()=>{const r=await fetch(`${base}/api/health`);const h=await r.json();assert.equal(h.ok,true);assert.equal(h.apiConfigured,false);assert.ok(h.brawlerCount>0);});
+test('servidor inicia com catálogo inicial e API explicitamente desativada',async()=>{const r=await fetch(`${base}/api/health`);const h=await r.json();assert.equal(h.ok,true);assert.equal(h.apiConfigured,false);assert.equal(h.appVersion,'5.0.2');assert.equal(h.playerSync.intervalSeconds,60);assert.equal(h.playerSync.minRequestIntervalMs,300);assert.ok(h.brawlerCount>0);});
 
 test('catálogo público inclui o snapshot e os três lançamentos de novembro de 2026 sem duplicatas',async()=>{const r=await fetch(`${base}/api/brawlers`);assert.equal(r.status,200);const data=await r.json();assert.ok(data.items.length>=111);assert.equal(new Set(data.items.map(x=>x.key)).size,data.items.length);assert.ok(data.items.every(x=>x.name&&x.key));for(const name of ['Thunder Frogs','Rey','Ruby'])assert.ok(data.items.some(x=>x.name===name),`Faltou ${name}`);assert.ok(!data.items.some(x=>x.name==='Buzz Lightyear'));assert.ok(data.items.filter(x=>['Thunder Frogs','Rey','Ruby'].includes(x.name)).every(x=>x.imageUrl2));assert.ok(data.items.filter(x=>!['Thunder Frogs','Rey','Ruby'].includes(x.name)).every(x=>x.modelImageUrl&&x.modelImageUrl.includes('/brawlers/model/')));});
 
@@ -31,7 +31,7 @@ test('candidatura não bloqueia após tentativas inválidas e aceita telefone br
 
 test('reserva de Brawler é atômica sob duas candidaturas simultâneas',async()=>{const make=(tag,name,phone)=>fetch(`${base}/api/applications`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:name,gameNickname:name,playerTag:tag,ageRange:'18-24',phone,phoneType:'self',desiredBrawlerId:'shelly',privacyAcknowledged:true})});const results=await Promise.all([make('PYLQG','Jogador A','+5511999999991'),make('QRGPL','Jogador B','+5511999999992')]);const statuses=results.map(r=>r.status).sort();assert.deepEqual(statuses,[201,409]);const roster=await (await fetch(`${base}/api/brawlers`)).json();assert.equal(roster.items.find(b=>b.key==='shelly').status,'RESERVED');});
 
-test('métricas não inventam troféus quando não há membros ativos',async()=>{const r=await fetch(`${base}/api/public/summary`);const s=await r.json();assert.equal(s.activeMembers,0);assert.equal(s.totalTrophies,null);assert.equal(s.mostUsedBrawler,null);});
+test('métricas não inventam troféus quando não há membros ativos',async()=>{const r=await fetch(`${base}/api/public/summary`);const s=await r.json();assert.equal(s.activeMembers,0);assert.equal(s.totalTrophies,null);assert.equal(s.mostUsedBrawler,null);assert.equal(s.totalOfficialVictories,null);assert.equal(s.totalBrawlersOwned,null);assert.equal(s.profileStatsCoverage,0);});
 
 test('dados de candidaturas não são públicos e exigem autenticação',async()=>{const r=await fetch(`${base}/api/admin/applications`);assert.equal(r.status,401);});
 
@@ -44,6 +44,7 @@ test('acessos são separados da navegação pública e exibem escolha de portal'
  assert.match(html,/id=\"page-access\"/);
  assert.match(html,/id=\"topAccessButton\"/);
  assert.match(html,/id=\"memberLoginForm\"/);
+ assert.match(html,/id=\"memberAccountRequestForm\"/);
  assert.match(html,/id=\"adminLoginForm\"/);
  assert.doesNotMatch(html,/class=\"workspace-switch\"/);
  assert.match(app,/expectedRole==='MEMBER'/);

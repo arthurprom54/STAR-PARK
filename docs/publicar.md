@@ -66,7 +66,9 @@ Em **Environment → Environment Variables**, crie:
 | `STAR_PARK_OWNER_PASSWORD` | Senha exclusiva com pelo menos 14 caracteres |
 | `STAR_PARK_SESSION_SECRET` | Segredo aleatório longo, diferente da senha |
 | `BRAWL_STARS_API_TOKEN` | Token oficial, depois de configurar a restrição de IP |
-| `BRAWLER_SYNC_INTERVAL_HOURS` | `6` |
+| `BRAWLER_SYNC_INTERVAL_HOURS` | `6` (catálogo visual) |
+| `STAR_PARK_PLAYER_SYNC_INTERVAL_SECONDS` | `60` (intervalo-alvo entre ciclos; mínimo 30) |
+| `STAR_PARK_API_MIN_REQUEST_INTERVAL_MS` | `300` (espaçamento global mínimo entre chamadas oficiais) |
 | `STAR_PARK_RECRUITMENT_OPEN_ON_BOOT` | `false` |
 
 O JSON da conta de serviço deve ser inserido inteiro em `FIREBASE_SERVICE_ACCOUNT_JSON`. Como alternativa, é possível usar `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL` e `FIREBASE_PRIVATE_KEY` em três variáveis separadas. Nunca coloque o valor em `app.js`, `index.html`, `.env` commitado ou mensagens.
@@ -136,3 +138,17 @@ Faça backups periódicos também pelas ferramentas do Google Cloud. O export JS
 - https://render.com/docs/web-services
 - https://render.com/docs/outbound-ip-addresses
 - https://render.com/docs/dedicated-ips
+
+
+## Automação pelo GitHub (v5.0.2)
+
+O workflow `.github/workflows/star-park-release.yml` adiciona um botão em **Actions → STAR PARK — validar e publicar → Run workflow**. Primeiro executa verificações de sintaxe e todos os testes; só depois solicita o deploy do Render e aguarda o endpoint `/api/health` confirmar que a nova versão está ativa.
+
+Antes de executar, configure no repositório:
+
+- Secret `RENDER_DEPLOY_HOOK_URL`: deploy hook privado do serviço Web no Render.
+- Variable `STAR_PARK_HEALTH_URL`: URL pública completa do endpoint `https://SEU-SITE/api/health`.
+
+O serviço Render precisa estar com `STAR_PARK_STORAGE_DRIVER=firestore`, `BRAWL_STARS_API_TOKEN`, `STAR_PARK_SESSION_SECRET`, `STAR_PARK_OWNER_EMAIL` e `STAR_PARK_OWNER_PASSWORD` configurados em Environment. O workflow não contém nem imprime essas credenciais. A etapa de pós-deploy falha se Firestore, OWNER, chave da Supercell, versão 5.0.2, intervalo de 60 segundos, execução integral da última sincronização ou healthcheck não estiverem ativos.
+
+A sincronização de jogadores ocorre no processo Node.js do serviço web. O intervalo de 60 segundos é a frequência-alvo entre ciclos, não uma promessa de que qualquer quantidade de membros será consultada em 60 segundos: o tempo do ciclo depende do número de jogadores, latência e limites da API. Se a API responder HTTP 429, o servidor respeita `Retry-After` (ou uma pausa de segurança) e preserva os dados anteriores.

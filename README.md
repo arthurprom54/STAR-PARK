@@ -1,4 +1,4 @@
-# STAR PARK 5.0.0 — A arena é nossa!
+# STAR PARK 5.0.2 — A arena é nossa!
 
 Plataforma comunitária independente para organizar a House STAR PARK de Brawl Stars. Não é produto oficial, não possui vínculo, patrocínio nem aprovação da Supercell.
 
@@ -23,10 +23,13 @@ A aplicação possui três áreas separadas:
 - Enciclopédia de Brawlers com imagens, pesquisa, filtros por raridade/classe/estado e ficha de detalhes.
 - Rankings de troféus e evolução desde o baseline.
 - Estatísticas agregadas, eventos, comunicados e recrutamento.
+- Atualização visual automática de perfis e indicadores a cada 60 segundos por padrão.
+- Histórico próprio deduplicado das batalhas que a API forneceu durante a coleta.
 - Aviso de privacidade e aviso de independência da Supercell.
 
 ### 2. Área dos membros
-- Login individual.
+- Cadastro próprio de primeiro acesso, com senha protegida e aprovação administrativa obrigatória.
+- Login individual e sessão protegida.
 - Painel pessoal com troféus atuais, baseline e evolução, quando disponíveis.
 - Edição limitada do próprio perfil e das preferências de visibilidade.
 - Eventos, inscrições e mural interno.
@@ -120,15 +123,17 @@ Configure no `.env`:
 ```env
 BRAWL_STARS_API_TOKEN=token_emitido_no_portal_oficial
 BRAWLER_SYNC_INTERVAL_HOURS=6
+STAR_PARK_PLAYER_SYNC_INTERVAL_SECONDS=60
+STAR_PARK_API_MIN_REQUEST_INTERVAL_MS=300
 ```
 
 A chave permanece exclusivamente no servidor. Ela é usada para consultar jogadores por tag, troféus e battlelogs; não é necessária para exibir o catálogo visual. A autorização depende das regras vigentes no portal da Supercell, incluindo IP autorizado quando exigido. Não presuma que qualquer hospedagem serverless tem IP de saída fixo.
 
-A aplicação trata falhas e mantém o último valor válido; não inventa troféus. A API oficial não fornece um agregado vitalício comunitário do “Brawler mais usado”. O site calcula o indicador a partir dos battlelogs recentes consultados. “Brawler com mais troféus” é calculado somando os troféus desse Brawler nos perfis dos membros ativos sincronizados.
+A aplicação trata falhas, serializa chamadas autenticadas com espaçamento global, respeita pausas HTTP 429 e mantém o último valor válido; não inventa troféus. A API oficial não fornece um agregado vitalício comunitário do “Brawler mais usado”. O site calcula o indicador a partir dos battlelogs recentes consultados. “Brawler com mais troféus” é calculado somando os troféus desse Brawler nos perfis dos membros ativos sincronizados.
 
 ## Regras de negócio principais
 
-- A House é independente; membros são cadastrados pela administração usando tags de jogador.
+- A House é independente; membros são cadastrados pela administração usando tags de jogador. Depois de ativos, eles podem solicitar conta própria e aguardar aprovação administrativa.
 - A candidatura não pede troféus; a plataforma consulta a API quando configurada. O recrutamento começa fechado por padrão e só deve ser aberto após a revisão de privacidade e armazenamento.
 - Uma candidatura válida reserva o Brawler desejado; a operação serializada impede duas reservas concorrentes nesta instância.
 - Rejeição, cancelamento e expiração liberam reserva. Aprovação não ativa o membro.
@@ -173,7 +178,9 @@ Para desenvolvimento local, `STAR_PARK_STORAGE_DRIVER=json` mantém o comportame
 | `STAR_PARK_OWNER_PASSWORD` | Senha inicial do OWNER, mínimo 14 caracteres |
 | `STAR_PARK_SESSION_SECRET` | Segredo HMAC para cookies de sessão |
 | `BRAWL_CATALOG_API_URL` | Fonte pública do catálogo visual (sem chave) |
-| `BRAWLER_SYNC_INTERVAL_HOURS` | Intervalo da sincronização visual, padrão 6 horas |
+| `BRAWLER_SYNC_INTERVAL_HOURS` | Intervalo de sincronização do catálogo visual, padrão 6 horas |
+| `STAR_PARK_PLAYER_SYNC_INTERVAL_SECONDS` | Intervalo-alvo entre ciclos de consulta, padrão 60 segundos (mínimo 30; máximo 3600) |
+| `STAR_PARK_API_MIN_REQUEST_INTERVAL_MS` | Espaçamento global mínimo entre chamadas autenticadas à Supercell, padrão 300 ms (mínimo 100) |
 | `STAR_PARK_DISABLE_CATALOG_SYNC` | Desativa sincronização automática quando `1` (testes) |
 | `STAR_PARK_DATA_DIR` | Diretório alternativo de dados/cache, útil em testes |
 | `STAR_PARK_STORAGE_DRIVER` | `json` para desenvolvimento ou `firestore` para produção |
@@ -202,3 +209,8 @@ Não há estimativa de custo de nuvem nesta entrega, pois nenhum provedor de pro
 A navegação de acesso foi reorganizada: visitantes veem apenas a área pública; o botão **ENTRAR** abre uma página separada para escolher o portal de membro ou o acesso administrativo. O link de administração também fica discretamente no rodapé. Depois de autenticar, o menu lateral passa a mostrar somente a área correspondente ao papel da conta.
 
 Consulte [`docs/publicar.md`](docs/publicar.md) para o passo a passo de publicação como Node Web Service no Render com Firestore, variáveis secretas, criação do OWNER, integração da API oficial, migração de dados e backups.
+
+
+## Notas da versão 5.0.2
+
+Consulte [docs/alteracoes-v5-0-2.md](docs/alteracoes-v5-0-2.md) para as correções, verificações e limites conhecidos desta versão.

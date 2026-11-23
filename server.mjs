@@ -5,8 +5,10 @@ import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {promisify} from 'node:util';
 import {loadStoreFromFirestore, mutateStoreInFirestore, syncStoreObject} from './lib/firestore-store.mjs';
+import {aggregateBattleStats, extractBattleRecords, normalizePlayerStats} from './lib/brawl-stats.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION = '5.0.2';
 const PORT = Number(process.env.PORT || 4173);
 const API_BASE = 'https://api.brawlstars.com/v1';
 const CATALOG_API_URL = process.env.BRAWL_CATALOG_API_URL || 'https://api.brawlapi.com/v1/brawlers';
@@ -14,7 +16,13 @@ const API_TOKEN = process.env.BRAWL_STARS_API_TOKEN || '';
 const SESSION_SECRET = process.env.STAR_PARK_SESSION_SECRET || '';
 const OWNER_EMAIL = (process.env.STAR_PARK_OWNER_EMAIL || '').trim().toLowerCase();
 const OWNER_PASSWORD = process.env.STAR_PARK_OWNER_PASSWORD || '';
-const INTERVAL_HOURS = Math.min(336, Math.max(1, Number(process.env.BRAWLER_SYNC_INTERVAL_HOURS || 6)));
+const CATALOG_INTERVAL_RAW = Number(process.env.BRAWLER_SYNC_INTERVAL_HOURS || 6);
+const PLAYER_INTERVAL_RAW = Number(process.env.STAR_PARK_PLAYER_SYNC_INTERVAL_SECONDS || 60);
+const API_REQUEST_INTERVAL_RAW = Number(process.env.STAR_PARK_API_MIN_REQUEST_INTERVAL_MS || 300);
+const CATALOG_SYNC_INTERVAL_HOURS = Number.isFinite(CATALOG_INTERVAL_RAW) ? Math.min(336, Math.max(1, Math.round(CATALOG_INTERVAL_RAW))) : 6;
+const PLAYER_SYNC_INTERVAL_SECONDS = Number.isFinite(PLAYER_INTERVAL_RAW) ? Math.min(3600, Math.max(30, Math.round(PLAYER_INTERVAL_RAW))) : 60;
+const PLAYER_SYNC_INTERVAL_MS = PLAYER_SYNC_INTERVAL_SECONDS * 1000;
+const API_MIN_REQUEST_INTERVAL_MS = Number.isFinite(API_REQUEST_INTERVAL_RAW) ? Math.min(5000, Math.max(100, Math.round(API_REQUEST_INTERVAL_RAW))) : 300;
 const DATA_DIR = process.env.STAR_PARK_DATA_DIR || path.join(ROOT, 'data');
 const STORAGE_DRIVER = String(process.env.STAR_PARK_STORAGE_DRIVER || 'json').trim().toLowerCase();
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
@@ -26,6 +34,8 @@ const scrypt = promisify(crypto.scrypt);
 const sessions = new Map();
 const requestWindows = new Map();
 let storeQueue = Promise.resolve();
+let officialApiQueue = Promise.resolve();
+let nextOfficialApiRequestAt = 0;
 let firestoreDb = null;
 let roster = [];
 let rosterSupplements = [];
@@ -33,12 +43,19 @@ let rosterSource = 'snapshot';
 let lastSuccessfulSync = null;
 let lastSyncError = null;
 let catalogSyncInProgress = false;
+let playerSyncInProgress = false;
+let lastPlayerSyncAt = null;
+let lastPlayerSyncError = null;
+let lastPlayerSyncDurationMs = null;
+let apiCooldownUntil = 0;
+let apiCooldownStatus = 429;
+let apiCooldownMessage = 'Aguardando a liberação do limite de consultas da API oficial.';
 const playerCache = new Map();
 
 const defaultStore = () => ({
   users: [], applications: [], members: [], events: [], announcements: [], audit: [],
-  privacyRequests: [], snapshots: [], messageLogs: [],
-  settings: {recruitmentOpen:process.env.STAR_PARK_RECRUITMENT_OPEN_ON_BOOT==='true',recruitmentClosedMessage:'As inscrições estão temporariamente fechadas.',showNickname:true,showTag:false,showEvolution:true,reservationHours:72,syncIntervalHours:6},
+  privacyRequests: [], snapshots: [], messageLogs: [], accountRequests: [],
+  settings: {recruitmentOpen:process.env.STAR_PARK_RECRUITMENT_OPEN_ON_BOOT==='true',recruitmentClosedMessage:'As inscrições estão temporariamente fechadas.',showNickname:true,showTag:false,showEvolution:true,reservationHours:72,syncIntervalHours:6,syncIntervalSeconds:60},
 });
 let store = defaultStore();
 
@@ -65,7 +82,7 @@ const allowedAgeRanges = new Set(['12-14','15-17','18-24','25+']);
 const roles = new Set(['OWNER','ADMIN','MODERATOR','MEMBER']);
 const rolePermissions = {
   OWNER:['*'],
-  ADMIN:['applications.read','applications.write','members.read','members.write','events.write','announcements.write','messages.write','users.read','privacy.read','settings.write','api.sync','audit.read'],
+  ADMIN:['applications.read','applications.write','members.read','members.write','events.write','announcements.write','messages.write','users.read','users.write','privacy.read','settings.write','api.sync','audit.read'],
   MODERATOR:['applications.read','applications.write','members.read','events.write','announcements.write','messages.write','audit.read'],
   MEMBER:['member.self'],
 };
@@ -78,7 +95,69 @@ function defaultPermissions(role){return rolePermissions[role]||[];}
 async function readJSON(file,fallback){try{return JSON.parse(await fs.readFile(file,'utf8'));}catch{return fallback;}}
 async function saveStore(){if(firestoreDb)throw new Error('saveStore local não pode ser usado com Firestore.');await fs.mkdir(DATA_DIR,{recursive:true});const temp=`${STORE_FILE}.${process.pid}.tmp`;await fs.writeFile(temp,JSON.stringify(store,null,2),{mode:0o600});await fs.rename(temp,STORE_FILE);}
 async function mutate(fn){const run=storeQueue.then(async()=>{if(firestoreDb)return mutateStoreInFirestore(firestoreDb,store,fn,defaultStore);const result=await fn();await saveStore();return result;});storeQueue=run.catch(()=>{});return run;}
-async function syncAllMembers(){if(!API_TOKEN)return;const active=store.members.filter(m=>m.status==='ACTIVE').map(m=>({id:m.id,displayName:m.displayName,playerTag:m.playerTag}));for(const member of active){try{const refresh=await refreshMember(member);await mutate(()=>{const current=store.members.find(m=>m.id===member.id&&m.status==='ACTIVE');if(!current)return;Object.assign(current,refresh.updates);store.snapshots.push(...refresh.snapshots);audit(null,'Sincronização automática de jogador',`${current.displayName} • ${current.playerTag}`);});}catch(e){await mutate(()=>{const current=store.members.find(m=>m.id===member.id);if(current)current.apiSyncStatus='STALE';audit(null,'Falha na sincronização automática',`${member.displayName}: ${fmtError(e)}`);});}}}
+const sleep=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
+async function syncAllMembers(){
+  if(!API_TOKEN)return {ok:false,reason:'API_NOT_CONFIGURED'};
+  if(playerSyncInProgress)return {ok:true,skipped:true,reason:'SYNC_ALREADY_RUNNING'};
+  if(Date.now()<apiCooldownUntil)return {ok:false,skipped:true,reason:'API_COOLDOWN',retryAt:new Date(apiCooldownUntil).toISOString()};
+  playerSyncInProgress=true;
+  const startedAt=Date.now();
+  const active=store.members.filter(m=>m.status==='ACTIVE').map(m=>({id:m.id,displayName:m.displayName,playerTag:m.playerTag,gameNickname:m.gameNickname,baselineStatus:m.baselineStatus,currentTrophies:m.currentTrophies,currentTrophiesCapturedAt:m.currentTrophiesCapturedAt}));
+  const successful=[],failed=[];
+  try{
+    for(let index=0;index<active.length;index++){
+      const member=active[index];
+      try{
+        const refresh=await refreshMember(member);
+        successful.push({memberId:member.id,refresh});
+      }catch(error){
+        failed.push({memberId:member.id,displayName:member.displayName,error:fmtError(error),status:Number(error.status)||0});
+        if(Number(error.status)===429){
+          for(const waiting of active.slice(index+1))failed.push({memberId:waiting.id,displayName:waiting.displayName,error:apiCooldownMessage,status:apiCooldownStatus});
+          break;
+        }
+      }
+      // If any official API call triggered a cooldown after the profile succeeded, mark the remaining queue as waiting too.
+      if(Date.now()<apiCooldownUntil){
+        for(const waiting of active.slice(index+1))failed.push({memberId:waiting.id,displayName:waiting.displayName,error:apiCooldownMessage,status:apiCooldownStatus});
+        break;
+      }
+    }
+    await mutate(()=>{
+      for(const item of successful){
+        const current=store.members.find(m=>m.id===item.memberId&&m.status==='ACTIVE');
+        if(!current)continue;
+        const previousTrophies=current.currentTrophies;
+        const previousTrophiesAt=current.currentTrophiesCapturedAt;
+        Object.assign(current,item.refresh.updates);
+        if(item.refresh.snapshots?.length)store.snapshots.push(...item.refresh.snapshots);
+        const history=Array.isArray(current.trophyHistory)?current.trophyHistory.slice():[];
+        if(!history.length&&validNumber(previousTrophies))history.push({trophies:Number(previousTrophies),capturedAt:previousTrophiesAt||null,source:'profile-cache'});
+        const nextTrophies=item.refresh.updates.currentTrophies;
+        const lastHistory=history.at(-1);
+        if(validNumber(nextTrophies)&&(!lastHistory||Number(lastHistory.trophies)!==Number(nextTrophies)))history.push({trophies:Number(nextTrophies),capturedAt:item.refresh.updates.currentTrophiesCapturedAt,source:'brawl-stars-api'});
+        current.trophyHistory=history.slice(-180);
+        const knownBattles=new Set((current.battleHistory||[]).map(b=>b.id));
+        const newBattles=(item.refresh.battleRecords||[]).filter(battle=>!knownBattles.has(battle.id));
+        applyBattleRecords(current,newBattles);
+      }
+      for(const item of failed){
+        const current=store.members.find(m=>m.id===item.memberId);
+        if(current){current.apiSyncStatus=item.status===429?'RATE_LIMITED':'STALE';current.apiSyncError=item.error;current.lastSyncAttemptAt=nowISO();}
+        if(!store.audit.some(a=>a.action==='Falha na sincronização automática'&&a.detail.startsWith(`${item.displayName}:`)&&Date.now()-Date.parse(a.at)<15*60*1000))audit(null,'Falha na sincronização automática',`${item.displayName}: ${item.error}`);
+      }
+      // Battle details and usage counters live inside each member document to keep Firestore writes bounded.
+      store.snapshots=store.snapshots.slice(-50000);
+    });
+    const partial=successful.filter(item=>item.refresh.updates.apiSyncStatus==='PARTIAL').length;
+    lastPlayerSyncAt=nowISO();
+    lastPlayerSyncError=failed.length||partial?`${failed.length} falha(s) e ${partial} perfil(is) parcial(is) na última rodada.${failed[0]?.error?` Primeira falha: ${failed[0].error}`:''}`:null;
+    lastPlayerSyncDurationMs=Date.now()-startedAt;
+    return {ok:failed.length===0&&partial===0,activeMembers:active.length,updated:successful.length,partial,failed:failed.length,durationMs:lastPlayerSyncDurationMs};
+  }catch(error){
+    lastPlayerSyncError=fmtError(error);lastPlayerSyncDurationMs=Date.now()-startedAt;throw error;
+  }finally{playerSyncInProgress=false;}
+}
 async function expireAbandonedReservations(){const now=Date.now();const expired=store.applications.filter(a=>a.status==='PENDING'&&a.reservationExpiresAt&&Date.parse(a.reservationExpiresAt)<now);if(!expired.length)return;await mutate(()=>{for(const app of expired){app.status='CANCELLED';app.updatedAt=nowISO();app.history.push({status:'CANCELLED',at:nowISO(),by:'Sistema',reason:'Reserva expirada por candidatura sem início de análise.'});audit(null,'Reserva expirada',`${app.displayName} • ${app.desiredBrawlerName}`);}});}
 async function initStore(){
   if(process.env.NODE_ENV==='production'&&STORAGE_DRIVER!=='firestore')throw new Error('Em produção, STAR_PARK_STORAGE_DRIVER deve ser firestore. O armazenamento JSON é somente para desenvolvimento.');
@@ -157,7 +236,34 @@ function normalizeRoster(payload){
     };
   }).filter(Boolean).sort((a,b)=>(a.sortOrder??99999999)-(b.sortOrder??99999999)||a.name.localeCompare(b.name));
 }
-async function officialFetch(endpoint){if(!API_TOKEN)throw httpError(503,'A integração com a API oficial ainda não foi configurada no servidor.');const response=await fetch(`${API_BASE}${endpoint}`,{headers:{Authorization:`Bearer ${API_TOKEN}`,Accept:'application/json'},signal:AbortSignal.timeout(15000)});if(!response.ok){const messages={400:'A API rejeitou os parâmetros enviados.',401:'A chave da API foi recusada.',403:'A API negou o acesso. Verifique a chave e o IP autorizado.',404:'Jogador ou recurso não encontrado.',429:'Limite de consultas da API atingido.',500:'A API oficial apresentou erro interno.',503:'A API oficial está temporariamente indisponível.'};throw httpError(response.status,messages[response.status]||`A API respondeu com HTTP ${response.status}.`);}return response.json();}
+async function officialFetch(endpoint){
+  if(!API_TOKEN)throw httpError(503,'A integração com a API oficial ainda não foi configurada no servidor.');
+  const request=officialApiQueue.then(async()=>{
+    if(Date.now()<apiCooldownUntil)throw httpError(429,'A API oficial pediu uma pausa nas consultas. A sincronização será retomada automaticamente.');
+    const wait=Math.max(0,nextOfficialApiRequestAt-Date.now());
+    if(wait)await sleep(wait);
+    if(Date.now()<apiCooldownUntil)throw httpError(429,'A API oficial pediu uma pausa nas consultas. A sincronização será retomada automaticamente.');
+    nextOfficialApiRequestAt=Date.now()+API_MIN_REQUEST_INTERVAL_MS;
+    const response=await fetch(`${API_BASE}${endpoint}`,{headers:{Authorization:`Bearer ${API_TOKEN}`,Accept:'application/json'},signal:AbortSignal.timeout(15000)});
+    if(!response.ok){
+      const messages={400:'A API rejeitou os parâmetros enviados.',401:'A chave da API foi recusada.',403:'A API negou o acesso. Verifique a chave e o IP autorizado.',404:'Jogador ou recurso não encontrado.',429:'Limite de consultas da API atingido.',500:'A API oficial apresentou erro interno.',503:'A API oficial está temporariamente indisponível.'};
+      if([401,403,429,500,503].includes(response.status)){
+        const retry=response.headers.get('retry-after');
+        const fallbackSeconds=response.status===429?60:response.status===500?30:response.status===503?60:300;
+        const retryAt=retry&&/^\d+$/.test(retry)?Date.now()+Number(retry)*1000:retry?Date.parse(retry):NaN;
+        const requestedSeconds=Number.isFinite(retryAt)?Math.ceil((retryAt-Date.now())/1000):fallbackSeconds;
+        const seconds=Math.max(30,Math.min(requestedSeconds,900));
+        apiCooldownStatus=response.status;
+        apiCooldownMessage=messages[response.status]||`A API respondeu com HTTP ${response.status}.`;
+        apiCooldownUntil=Math.max(apiCooldownUntil,Date.now()+Math.max(30,Math.min(seconds,900))*1000);
+      }
+      throw httpError(response.status,messages[response.status]||`A API respondeu com HTTP ${response.status}.`);
+    }
+    return response.json();
+  });
+  officialApiQueue=request.catch(()=>{});
+  return request;
+}
 async function fetchAllBrawlers(){const all=[];const seenCursors=new Set();let after=null;for(let page=0;page<20;page++){const query=new URLSearchParams({limit:'200'});if(after)query.set('after',after);const payload=await officialFetch(`/brawlers?${query.toString()}`);const items=Array.isArray(payload?.items)?payload.items:Array.isArray(payload?.list)?payload.list:Array.isArray(payload?.brawlers)?payload.brawlers:Array.isArray(payload)?payload:[];if(!items.length){if(page===0)throw new Error('A API não retornou Brawlers.');break;}all.push(...items);const next=payload?.paging?.cursors?.after||payload?.paging?.after||null;if(!next){if(items.length>=200)throw new Error('A API retornou uma página cheia sem cursor. Não é possível certificar que o catálogo está completo.');break;}if(seenCursors.has(next))throw new Error('Cursor de paginação repetido ao carregar o catálogo.');seenCursors.add(next);after=next;if(page===19)throw new Error('O catálogo excedeu o limite de páginas de segurança.');}return all;}
 async function syncBrawlers(){
   if(catalogSyncInProgress)return {ok:true,alreadyRunning:true,count:roster.length};
@@ -184,7 +290,7 @@ async function initRoster(){
   else{roster=normalizeRoster(snapshot);rosterSource='local-fallback';}
   if(process.env.STAR_PARK_DISABLE_CATALOG_SYNC!=='1'){
     syncBrawlers().catch(e=>console.warn(`[STAR PARK] Catálogo visual não foi atualizado; mantendo cache/fallback: ${fmtError(e)}`));
-    const timer=setInterval(()=>syncBrawlers().catch(e=>console.warn(`[STAR PARK] Atualização do catálogo falhou; mantendo última versão: ${fmtError(e)}`)),INTERVAL_HOURS*3600000);timer.unref();
+    const timer=setInterval(()=>syncBrawlers().catch(e=>console.warn(`[STAR PARK] Atualização do catálogo falhou; mantendo última versão: ${fmtError(e)}`)),CATALOG_SYNC_INTERVAL_HOURS*3600000);timer.unref();
   }
 }
 function rosterEntry(value){return roster.find(b=>String(b.id)===String(value)||b.key===String(value)||b.name.toLowerCase()===String(value).toLowerCase());}
@@ -203,24 +309,129 @@ function rateLimit(req,bucket,limit,windowMs){const key=`${bucket}:${req.socket.
 async function bodyJSON(req,max=40000){let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>max)throw httpError(413,'O envio excede o tamanho permitido.');}try{return raw?JSON.parse(raw):{};}catch{throw httpError(400,'Formato de dados inválido.');}}
 function sendJSON(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin'});res.end(JSON.stringify(data));}
 async function serveStatic(req,res,url){let requested;try{requested=decodeURIComponent(url.pathname);}catch{return sendJSON(res,400,{error:'Caminho inválido.'});}if(requested==='/')requested='/index.html';const allowed=new Set(['/index.html','/styles.css','/app.js','/brawlers.json','/brawlers-supplement.json','/assets/hero-crew.svg']);if(!allowed.has(requested))return sendJSON(res,404,{error:'Arquivo não encontrado.'});const file=path.resolve(PUBLIC_DIR,`.${requested}`);if(!file.startsWith(PUBLIC_DIR+path.sep))return sendJSON(res,403,{error:'Acesso negado.'});try{const body=await fs.readFile(file);res.writeHead(200,{'Content-Type':MIME[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','X-Frame-Options':'DENY','Permissions-Policy':'camera=(),microphone=(),geolocation=()','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' https://api.brawlapi.com; img-src 'self' data: https://cdn.brawlify.com https://cdn-misc.brawlify.com https://cdn.brawlhub.gg; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"});res.end(body);}catch{sendJSON(res,404,{error:'Arquivo não encontrado.'});}}
-async function fetchPlayer(tag,forceFresh=false){const normalized=cleanTag(tag);if(!tagIsValid(normalized))throw httpError(400,'Tag inválida. Confira os caracteres e tente novamente.');const cached=playerCache.get(normalized);if(!forceFresh&&cached&&Date.now()-cached.at<300000)return {...cached.data,cached:true};const encoded=encodeURIComponent(`#${normalized}`);const [playerResult,battleResult]=await Promise.allSettled([officialFetch(`/players/${encoded}`),officialFetch(`/players/${encoded}/battlelog`)]);if(playerResult.status==='rejected')throw playerResult.reason;const result={player:playerResult.value,battlelog:battleResult.status==='fulfilled'?(battleResult.value?.items||[]):[],battlelogAvailable:battleResult.status==='fulfilled',battlelogError:battleResult.status==='rejected'?fmtError(battleResult.reason):null,fetchedAt:nowISO()};playerCache.set(normalized,{at:Date.now(),data:result});return {...result,cached:false};}
-function battleBrawlerName(item,tag){const battle=item?.battle||{};const candidates=[...(Array.isArray(battle.players)?battle.players:[]),...(Array.isArray(battle.teams)?battle.teams.flat():[])];const self=candidates.find(p=>cleanTag(p?.tag)===cleanTag(tag));return self?.brawler?.name||battle.brawler?.name||null;}
-function getBrawlerUsage(){const counts=new Map();for(const m of store.members.filter(x=>x.status==='ACTIVE'))for(const battle of (m.recentBattles||[])){const name=battle.brawlerName;if(name)counts.set(name,(counts.get(name)||0)+1);}return [...counts].map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name));}
+async function fetchPlayer(tag,forceFresh=false){
+  const normalized=cleanTag(tag);
+  if(!tagIsValid(normalized))throw httpError(400,'Tag inválida. Confira os caracteres e tente novamente.');
+  const cached=playerCache.get(normalized);
+  if(!forceFresh&&cached&&Date.now()-cached.at<300000)return {...cached.data,cached:true};
+  const encoded=encodeURIComponent(`#${normalized}`);
+  const [playerResult,battleResult]=await Promise.allSettled([
+    officialFetch(`/players/${encoded}`),
+    officialFetch(`/players/${encoded}/battlelog`),
+  ]);
+  if(playerResult.status==='rejected')throw playerResult.reason;
+  const battlelog=battleResult.status==='fulfilled'?(Array.isArray(battleResult.value?.items)?battleResult.value.items:[]):[];
+  const result={player:playerResult.value,battlelog,battlelogAvailable:battleResult.status==='fulfilled',battlelogError:battleResult.status==='rejected'?fmtError(battleResult.reason):null,fetchedAt:nowISO()};
+  playerCache.set(normalized,{at:Date.now(),data:result});
+  if(playerCache.size>1000){const oldest=[...playerCache.entries()].sort((a,b)=>a[1].at-b[1].at).slice(0,200);for(const [key] of oldest)playerCache.delete(key);}
+  return {...result,cached:false};
+}
+function battleBrawlerName(item,tag){
+  const battle=item?.battle||{};
+  const candidates=[...(Array.isArray(battle.players)?battle.players:[]),...(Array.isArray(battle.teams)?battle.teams.flat():[])];
+  const self=candidates.find(p=>cleanTag(p?.tag)===cleanTag(tag));
+  return self?.brawler?.name||(candidates.length===0?battle.brawler?.name:null)||null;
+}
+function incrementCountMap(target,source){for(const [name,count] of Object.entries(source||{})){if(name)target[name]=(Number(target[name])||0)+(Number(count)||0);}}
+function applyBattleRecords(member,records){
+  if(!records.length)return;
+  const existing=member.battleUsage||{totalObserved:0,wins:0,losses:0,draws:0,brawlers:{},modes:{}};
+  const delta=aggregateBattleStats(records);
+  existing.totalObserved=(Number(existing.totalObserved)||0)+delta.totalObserved;
+  existing.wins=(Number(existing.wins)||0)+delta.wins;existing.losses=(Number(existing.losses)||0)+delta.losses;existing.draws=(Number(existing.draws)||0)+delta.draws;
+  existing.brawlers=existing.brawlers||{};existing.modes=existing.modes||{};
+  for(const row of delta.brawlers)existing.brawlers[row.name]=(Number(existing.brawlers[row.name])||0)+row.count;
+  for(const row of delta.modes)existing.modes[row.name]=(Number(existing.modes[row.name])||0)+row.count;
+  member.battleUsage=existing;
+  const byId=new Map((member.battleHistory||[]).map(b=>[b.id,b]));
+  for(const battle of records)byId.set(battle.id,battle);
+  member.battleHistory=[...byId.values()].sort((a,b)=>String(a.battleTime||a.observedAt).localeCompare(String(b.battleTime||b.observedAt))).slice(-100);
+}
+function aggregateHouseBattleStats(members){
+  const brawlers={},modes={};let totalObserved=0,wins=0,losses=0,draws=0;
+  for(const member of members){
+    const usage=member.battleUsage;
+    if(usage){totalObserved+=Number(usage.totalObserved)||0;wins+=Number(usage.wins)||0;losses+=Number(usage.losses)||0;draws+=Number(usage.draws)||0;incrementCountMap(brawlers,usage.brawlers);incrementCountMap(modes,usage.modes);}
+    else if(Array.isArray(member.recentBattles)&&member.recentBattles.length){for(const battle of member.recentBattles)if(battle.brawlerName){brawlers[battle.brawlerName]=(brawlers[battle.brawlerName]||0)+1;totalObserved++;}}
+  }
+  const sort=(obj,key)=>Object.entries(obj).map(([name,count])=>({name,[key]:count})).sort((a,b)=>b[key]-a[key]||a.name.localeCompare(b.name));
+  return {totalObserved,wins,losses,draws,brawlers:sort(brawlers,'count'),modes:sort(modes,'count')};
+}
+function getBrawlerUsage(){return aggregateHouseBattleStats(store.members.filter(m=>m.status==='ACTIVE')).brawlers;}
 function getBrawlerTrophyTotals(){const counts=new Map();for(const m of store.members.filter(x=>x.status==='ACTIVE'))for(const b of (m.brawlers||[])){if(validNumber(b.trophies))counts.set(b.name,(counts.get(b.name)||0)+Number(b.trophies));}return [...counts].map(([name,trophies])=>({name,trophies})).sort((a,b)=>b.trophies-a.trophies||a.name.localeCompare(b.name));}
-function publicMember(m){const settings=m.publicProfileSettings||{};return {id:m.id,displayName:m.displayName,gameNickname:store.settings.showNickname&&settings.showNickname!==false?m.gameNickname:null,playerTag:store.settings.showTag&&settings.showTag?m.playerTag:null,representedBrawlerName:m.representedBrawlerName,currentTrophies:m.currentTrophies,baselineTrophies:store.settings.showEvolution&&settings.showEvolution!==false?m.baselineTrophies:null,baselineStatus:m.baselineStatus,joinedAt:m.joinedAt,lastSyncedAt:m.currentTrophiesCapturedAt,avatar:m.avatar||null};}
-function publicSummary(){const members=store.members.filter(m=>m.status==='ACTIVE');const valid=members.filter(m=>validNumber(m.currentTrophies));const total=valid.reduce((sum,m)=>sum+Number(m.currentTrophies),0);const usage=getBrawlerUsage();const trophyTotals=getBrawlerTrophyTotals();const occupied=roster.filter(b=>brawlerState(b.key)==='UNAVAILABLE').length;const reserved=roster.filter(b=>brawlerState(b.key)==='RESERVED').length;return {activeMembers:members.length,totalTrophies:valid.length?total:null,validTrophyProfiles:valid.length,brawlerCount:roster.length,representedBrawlers:occupied,reservedBrawlers:reserved,availableBrawlers:roster.length-occupied-reserved,mostUsedBrawler:usage[0]||null,mostTrophyBrawler:trophyTotals[0]||null,usage,trophyTotals,topPlayers:valid.sort((a,b)=>b.currentTrophies-a.currentTrophies).slice(0,5).map(publicMember),updatedAt:valid.reduce((max,m)=>!max||String(m.currentTrophiesCapturedAt)>max?m.currentTrophiesCapturedAt:max,null)};}
-function buildMemberFromApi(api,extra){const p=api.player;const battleCounts=new Map();for(const item of api.battlelog||[]){const b=battleBrawlerName(item,extra.playerTag);if(b)battleCounts.set(b,(battleCounts.get(b)||0)+1);}return {...extra,gameNickname:p.name||extra.gameNickname,playerTag:cleanTag(p.tag||extra.playerTag),currentTrophies:validNumber(p.trophies)?Number(p.trophies):null,currentTrophiesCapturedAt:api.fetchedAt,apiSyncStatus:'OK',brawlers:Array.isArray(p.brawlers)?p.brawlers.map(b=>({name:b.name,trophies:Number(b.trophies)||0,power:Number(b.power)||null,rank:Number(b.rank)||null})):[],recentBattles:[...battleCounts].flatMap(([b,count])=>Array.from({length:count},()=>({brawlerName:b}))),};}
-async function captureBaseline(member){try{const api=await fetchPlayer(member.playerTag,true);const baselineTrophies=validNumber(api.player.trophies)?Number(api.player.trophies):null;const updates={baselineTrophies,baselineCapturedAt:api.fetchedAt,baselineStatus:baselineTrophies===null?'PENDING_CAPTURE':'CAPTURED',currentTrophies:baselineTrophies,currentTrophiesCapturedAt:api.fetchedAt,brawlers:Array.isArray(api.player.brawlers)?api.player.brawlers.map(b=>({name:b.name,trophies:Number(b.trophies)||0,power:Number(b.power)||null,rank:Number(b.rank)||null})):[],recentBattles:(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,member.playerTag)})).filter(x=>x.brawlerName)};return {updates,snapshots:[{id:id(),memberId:member.id,trophies:baselineTrophies,capturedAt:api.fetchedAt,source:'brawl-stars-api',syncStatus:updates.baselineStatus}]};}catch{return {updates:{baselineTrophies:null,baselineCapturedAt:null,baselineStatus:'PENDING_CAPTURE',currentTrophies:null,currentTrophiesCapturedAt:null,apiSyncStatus:'PENDING'},snapshots:[]};}}
-async function refreshMember(member){const api=await fetchPlayer(member.playerTag,true);const p=api.player;let updates={gameNickname:p.name||member.gameNickname,currentTrophies:validNumber(p.trophies)?Number(p.trophies):null,currentTrophiesCapturedAt:api.fetchedAt,apiSyncStatus:'OK',brawlers:Array.isArray(p.brawlers)?p.brawlers.map(b=>({name:b.name,trophies:Number(b.trophies)||0,power:Number(b.power)||null,rank:Number(b.rank)||null})):[],recentBattles:(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,member.playerTag)})).filter(x=>x.brawlerName)};let snapshots=[];if(member.baselineStatus==='PENDING_CAPTURE'){const baseline=await captureBaseline({...member,...updates});updates={...updates,...baseline.updates};snapshots.push(...baseline.snapshots);}snapshots.push({id:id(),memberId:member.id,trophies:updates.currentTrophies,capturedAt:api.fetchedAt,source:'brawl-stars-api',syncStatus:'OK'});return {updates,snapshots};}
+function publicMember(m){const settings=m.publicProfileSettings||{};return {id:m.id,displayName:m.displayName,gameNickname:store.settings.showNickname&&settings.showNickname!==false?m.gameNickname:null,playerTag:store.settings.showTag&&settings.showTag?m.playerTag:null,representedBrawlerName:m.representedBrawlerName,currentTrophies:m.currentTrophies,baselineTrophies:store.settings.showEvolution&&settings.showEvolution!==false?m.baselineTrophies:null,baselineStatus:m.baselineStatus,joinedAt:m.joinedAt,lastSyncedAt:m.currentTrophiesCapturedAt,apiSyncStatus:m.apiSyncStatus||'PENDING',avatar:m.avatar||null};}
+function sumStat(members,key){const values=members.map(m=>m.playerStats?.[key]);return members.length&&values.every(validNumber)?values.reduce((sum,n)=>sum+Number(n),0):null;}
+function publicSummary(){
+  const members=store.members.filter(m=>m.status==='ACTIVE');
+  const valid=members.filter(m=>validNumber(m.currentTrophies));
+  const total=valid.reduce((sum,m)=>sum+Number(m.currentTrophies),0);
+  const completeTrophyCoverage=members.length>0&&valid.length===members.length;
+  const usage=getBrawlerUsage();
+  const brawlerProfileCoverage=members.filter(m=>validNumber(m.playerStats?.brawlerCount)).length;
+  const trophyTotals=members.length>0&&brawlerProfileCoverage===members.length?getBrawlerTrophyTotals():[];
+  const battleStats=aggregateHouseBattleStats(members);
+  const occupied=roster.filter(b=>brawlerState(b.key)==='UNAVAILABLE').length;
+  const reserved=roster.filter(b=>brawlerState(b.key)==='RESERVED').length;
+  const statsMembers=members.filter(m=>m.playerStats&&typeof m.playerStats==='object');
+  const experienceValues=members.map(m=>m.playerStats?.experienceLevel).filter(validNumber);
+  const brawlerCountValues=members.map(m=>m.playerStats?.brawlerCount);
+  const victoryFields=['victories3v3','victoriesSolo','victoriesDuo'];
+  const officialVictoryProfiles=members.filter(m=>victoryFields.every(key=>validNumber(m.playerStats?.[key]))).length;
+  const clubCounts=new Map();for(const m of members){const name=m.playerStats?.club?.name;if(name)clubCounts.set(name,(clubCounts.get(name)||0)+1);}
+  const clubs=[...clubCounts].map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name));
+  return {
+    activeMembers:members.length,totalTrophies:completeTrophyCoverage?total:null,validTrophyProfiles:valid.length,
+    averageTrophies:valid.length?Math.round(total/valid.length):null,
+    highestProfileTrophies:completeTrophyCoverage?Math.max(...valid.map(m=>Number(m.playerStats?.highestTrophies??m.currentTrophies))):null,
+    brawlerProfileCoverage,
+    total3v3Victories:sumStat(members,'victories3v3'),totalSoloVictories:sumStat(members,'victoriesSolo'),totalDuoVictories:sumStat(members,'victoriesDuo'),
+    totalOfficialVictories:members.length&&officialVictoryProfiles===members.length?members.reduce((sum,m)=>sum+victoryFields.reduce((n,key)=>n+Number(m.playerStats[key]),0),0):null,
+    officialVictoryProfiles,
+    averageExperienceLevel:experienceValues.length===members.length&&members.length?Math.round(experienceValues.reduce((sum,n)=>sum+Number(n),0)/members.length):null,
+    totalBrawlersOwned:members.length&&brawlerCountValues.every(validNumber)?brawlerCountValues.reduce((sum,n)=>sum+Number(n),0):null,
+    profileStatsCoverage:statsMembers.length,
+    profileStatsTotal:members.length,brawlerCount:roster.length,representedBrawlers:occupied,reservedBrawlers:reserved,availableBrawlers:roster.length-occupied-reserved,
+    mostUsedBrawler:usage[0]||null,mostTrophyBrawler:trophyTotals[0]||null,usage,trophyTotals,
+    battleStats:{...battleStats,modes:battleStats.modes},clubs,
+    topPlayers:valid.sort((a,b)=>b.currentTrophies-a.currentTrophies).slice(0,5).map(publicMember),
+    updatedAt:valid.reduce((max,m)=>!max||String(m.currentTrophiesCapturedAt)>max?m.currentTrophiesCapturedAt:max,null),
+    playerSync:{intervalSeconds:PLAYER_SYNC_INTERVAL_SECONDS,minRequestIntervalMs:API_MIN_REQUEST_INTERVAL_MS,lastSyncAt:lastPlayerSyncAt,lastError:lastPlayerSyncError,inProgress:playerSyncInProgress,durationMs:lastPlayerSyncDurationMs,apiCooldownUntil:apiCooldownUntil?new Date(apiCooldownUntil).toISOString():null},
+  };
+}
+async function captureBaseline(member){
+  try{
+    const api=await fetchPlayer(member.playerTag,true);
+    const baselineTrophies=validNumber(api.player.trophies)?Number(api.player.trophies):null;
+    const updates={baselineTrophies,baselineCapturedAt:api.fetchedAt,baselineStatus:baselineTrophies===null?'PENDING_CAPTURE':'CAPTURED',currentTrophies:baselineTrophies,currentTrophiesCapturedAt:api.fetchedAt,trophyHistory:baselineTrophies===null?[]:[{trophies:baselineTrophies,capturedAt:api.fetchedAt,source:'baseline'}],playerStats:normalizePlayerStats(api.player),brawlers:Array.isArray(api.player.brawlers)?api.player.brawlers.map(b=>({id:b.id??null,name:b.name,trophies:validNumber(b.trophies)?Number(b.trophies):null,highestTrophies:validNumber(b.highestTrophies)?Number(b.highestTrophies):null,power:validNumber(b.power)?Number(b.power):null,rank:validNumber(b.rank)?Number(b.rank):null})):[],apiSyncStatus:api.battlelogAvailable?'OK':'PARTIAL',apiSyncError:api.battlelogError||null,recentBattles:(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,member.playerTag)})).filter(x=>x.brawlerName)};
+    const battleRecords=extractBattleRecords(api.battlelog,member.playerTag,member.id);
+    return {updates,battleRecords,snapshots:baselineTrophies===null?[]:[{id:id(),memberId:member.id,trophies:baselineTrophies,capturedAt:api.fetchedAt,source:'brawl-stars-api',syncStatus:updates.baselineStatus}]};
+  }catch{return {updates:{baselineTrophies:null,baselineCapturedAt:null,baselineStatus:'PENDING_CAPTURE',currentTrophies:null,currentTrophiesCapturedAt:null,apiSyncStatus:'PENDING'},battleRecords:[],snapshots:[]};}
+}
+async function refreshMember(member){
+  const api=await fetchPlayer(member.playerTag,true);
+  const p=api.player;
+  const currentTrophies=validNumber(p.trophies)?Number(p.trophies):null;
+  const battleRecords=extractBattleRecords(api.battlelog,member.playerTag,member.id);
+  const updates={gameNickname:p.name||member.gameNickname,currentTrophies,currentTrophiesCapturedAt:api.fetchedAt,playerStats:normalizePlayerStats(p),apiSyncStatus:api.battlelogAvailable?'OK':'PARTIAL',apiSyncError:api.battlelogError||null,lastSyncAttemptAt:api.fetchedAt,lastBattleLogSyncAt:api.battlelogAvailable?api.fetchedAt:(member.lastBattleLogSyncAt||null),brawlers:Array.isArray(p.brawlers)?p.brawlers.map(b=>({id:b.id??null,name:b.name,trophies:validNumber(b.trophies)?Number(b.trophies):null,highestTrophies:validNumber(b.highestTrophies)?Number(b.highestTrophies):null,power:validNumber(b.power)?Number(b.power):null,rank:validNumber(b.rank)?Number(b.rank):null})):[],recentBattles:(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,member.playerTag)})).filter(x=>x.brawlerName)};
+  const snapshots=[];
+  if(member.baselineStatus==='PENDING_CAPTURE'){
+    updates.baselineTrophies=currentTrophies;
+    updates.baselineCapturedAt=api.fetchedAt;
+    updates.trophyHistory=currentTrophies===null?[]:[{trophies:currentTrophies,capturedAt:api.fetchedAt,source:'baseline'}];
+    updates.baselineStatus=currentTrophies===null?'PENDING_CAPTURE':'CAPTURED';
+    if(currentTrophies!==null)snapshots.push({id:id(),memberId:member.id,trophies:currentTrophies,capturedAt:api.fetchedAt,source:'brawl-stars-api',syncStatus:'CAPTURED'});
+  }
+  return {updates,snapshots,battleRecords};
+}
 
 await initStore();
 await initRoster();
 const expiryTimer=setInterval(()=>expireAbandonedReservations().catch(e=>console.error('[STAR PARK] Falha ao expirar reservas:',fmtError(e))),10*60*1000);expiryTimer.unref();
-if(API_TOKEN){const playerSyncTimer=setInterval(()=>syncAllMembers().catch(e=>console.error('[STAR PARK] Sincronização dos membros falhou:',fmtError(e))),INTERVAL_HOURS*3600000);playerSyncTimer.unref();}
+if(API_TOKEN){const firstPlayerSync=setTimeout(()=>syncAllMembers().catch(e=>console.error('[STAR PARK] Sincronização inicial falhou:',fmtError(e))),5000);firstPlayerSync.unref();const playerSyncTimer=setInterval(()=>syncAllMembers().catch(e=>console.error('[STAR PARK] Sincronização dos membros falhou:',fmtError(e))),PLAYER_SYNC_INTERVAL_MS);playerSyncTimer.unref();}
 const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);
   try{
-    if(req.method==='GET'&&url.pathname==='/api/health')return sendJSON(res,200,{ok:true,apiConfigured:Boolean(API_TOKEN),brawlerCount:roster.length,catalogSource:rosterSource,catalogCount:roster.length,catalogLastSuccessfulSync:lastSuccessfulSync,catalogLastSyncError:lastSyncError,catalogAutomaticSyncHours:process.env.STAR_PARK_DISABLE_CATALOG_SYNC==='1'?null:INTERVAL_HOURS,ownerConfigured:Boolean(OWNER_EMAIL&&OWNER_PASSWORD&&SESSION_SECRET),storageDriver:STORAGE_DRIVER});
+    if(req.method==='GET'&&url.pathname==='/api/health')return sendJSON(res,200,{ok:true,appVersion:APP_VERSION,apiConfigured:Boolean(API_TOKEN),brawlerCount:roster.length,catalogSource:rosterSource,catalogCount:roster.length,catalogLastSuccessfulSync:lastSuccessfulSync,catalogLastSyncError:lastSyncError,catalogAutomaticSyncHours:process.env.STAR_PARK_DISABLE_CATALOG_SYNC==='1'?null:CATALOG_SYNC_INTERVAL_HOURS,playerSync:{intervalSeconds:PLAYER_SYNC_INTERVAL_SECONDS,minRequestIntervalMs:API_MIN_REQUEST_INTERVAL_MS,lastSyncAt:lastPlayerSyncAt,lastError:lastPlayerSyncError,inProgress:playerSyncInProgress,durationMs:lastPlayerSyncDurationMs,activeMembers:store.members.filter(m=>m.status==='ACTIVE').length,updatedMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='OK').length,partialMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='PARTIAL').length,staleMembers:store.members.filter(m=>m.status==='ACTIVE'&&['STALE','RATE_LIMITED'].includes(m.apiSyncStatus)).length,apiCooldownUntil:apiCooldownUntil?new Date(apiCooldownUntil).toISOString():null},ownerConfigured:Boolean(OWNER_EMAIL&&OWNER_PASSWORD&&SESSION_SECRET),storageDriver:STORAGE_DRIVER});
     if(req.method==='GET'&&url.pathname==='/api/brawlers')return sendJSON(res,200,{items:roster.map(b=>({...b,status:brawlerState(b.key),representative:memberForBrawler(b.key)?.displayName||null})),count:roster.length,source:rosterSource,lastSuccessfulSync,apiConfigured:Boolean(API_TOKEN),catalogApiUrl:'https://api.brawlapi.com/v1/brawlers',lastSyncError});
     if(req.method==='GET'&&url.pathname==='/api/public/summary')return sendJSON(res,200,publicSummary());
     if(req.method==='GET'&&url.pathname==='/api/public/members')return sendJSON(res,200,{items:store.members.filter(m=>m.status==='ACTIVE'&&m.publicProfileSettings?.public!==false).map(publicMember)});
@@ -241,10 +452,37 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='POST'&&url.pathname==='/api/login'){
       rateLimit(req,'login',12,15*60*1000);const body=await bodyJSON(req,5000);const email=safeText(body.email,180).toLowerCase();const password=String(body.password||'');const user=store.users.find(u=>u.email===email&&!u.disabled);if(!user||!user.passwordHash)throw httpError(401,'E-mail ou senha incorretos.');const hash=await scrypt(password,user.salt,64);if(!crypto.timingSafeEqual(hash,Buffer.from(user.passwordHash,'hex')))throw httpError(401,'E-mail ou senha incorretos.');if(!SESSION_SECRET)throw httpError(503,'O login ainda não foi ativado. Configure STAR_PARK_SESSION_SECRET no servidor.');const sessionId=crypto.randomBytes(32).toString('hex');const csrf=crypto.randomBytes(24).toString('hex');sessions.set(sessionId,{userId:user.id,csrf,expiresAt:Date.now()+12*60*60*1000});setCookie(res,'sp_session',`${sessionId}.${sessionSignature(sessionId)}`,{httpOnly:true});setCookie(res,'sp_csrf',csrf,{httpOnly:false});return sendJSON(res,200,{ok:true,user:publicUser(user)});
     }
+    if(req.method==='POST'&&url.pathname==='/api/member/account-requests'){
+      rateLimit(req,'member-account-request',3,60*60*1000);
+      const body=await bodyJSON(req,6000);
+      const email=safeText(body.email,180).toLowerCase();
+      const tag=cleanTag(body.playerTag);
+      const password=String(body.password||'');
+      if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw httpError(400,'Informe um e-mail válido.');
+      if(!tagIsValid(tag))throw httpError(400,'Tag de jogador inválida. Confira a tag no Brawl Stars.');
+      if(password.length<12||password.length>128)throw httpError(400,'A senha precisa ter entre 12 e 128 caracteres.');
+      const member=store.members.find(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE');
+      if(!member)throw httpError(409,'Não encontramos um membro ativo com essa tag. A administração precisa cadastrar e ativar sua entrada na House primeiro.');
+      if(store.users.some(u=>u.email===email))throw httpError(409,'Este e-mail já possui uma conta. Tente entrar ou fale com a administração.');
+      if(store.users.some(u=>u.role==='MEMBER'&&u.memberId===member.id))throw httpError(409,'Este membro já possui uma conta vinculada. Fale com a administração para recuperar o acesso.');
+      if(store.accountRequests.some(r=>r.status==='PENDING'&&(r.email===email||r.memberId===member.id)))throw httpError(409,'Já existe uma solicitação de acesso aguardando análise para este e-mail ou membro.');
+      const salt=crypto.randomBytes(16).toString('hex');
+      const passwordHash=(await scrypt(password,salt,64)).toString('hex');
+      const requestRecord={id:id(),memberId:member.id,displayName:member.displayName,playerTag:tag,email,salt,passwordHash,status:'PENDING',createdAt:nowISO(),reviewedAt:null,reviewedBy:null};
+      await mutate(()=>{
+        const currentMember=store.members.find(m=>m.id===member.id&&m.status==='ACTIVE'&&cleanTag(m.playerTag)===tag);
+        if(!currentMember)throw httpError(409,'O vínculo do jogador mudou. Peça à administração para confirmar seu cadastro.');
+        if(store.users.some(u=>u.email===email)||store.users.some(u=>u.role==='MEMBER'&&u.memberId===currentMember.id)||store.accountRequests.some(r=>r.status==='PENDING'&&(r.email===email||r.memberId===currentMember.id)))throw httpError(409,'Já existe uma conta ou solicitação para este e-mail ou membro.');
+        requestRecord.displayName=currentMember.displayName;
+        store.accountRequests.unshift(requestRecord);
+        audit(null,'Solicitação de conta de membro recebida',`${currentMember.displayName} • ${tag} • ${email}`);
+      });
+      return sendJSON(res,202,{ok:true,status:'PENDING',message:'Solicitação recebida. A administração precisa confirmar seu vínculo com a House antes de liberar o acesso.'});
+    }
     if(req.method==='GET'&&url.pathname==='/api/session'){const user=currentUser(req);const session=getSession(req);return sendJSON(res,200,{authenticated:Boolean(user),user:user?publicUser(user):null,csrf:session?.csrf||null});}
     if(req.method==='POST'&&url.pathname==='/api/logout'){checkCsrf(req);const cookies=parseCookies(req);sessions.delete(String(cookies.sp_session||'').split('.')[0]);clearCookie(res,'sp_session');clearCookie(res,'sp_csrf');return sendJSON(res,200,{ok:true});}
     const user=currentUser(req);
-    if(req.method==='GET'&&url.pathname==='/api/member/me'){requirePermission(user,'member.self');const member=store.members.find(m=>m.id===user.memberId&&m.status==='ACTIVE');if(!member)throw httpError(404,'Perfil de membro não encontrado.');return sendJSON(res,200,{member:{...publicMember(member),gameNickname:member.gameNickname,playerTag:member.playerTag,baselineTrophies:member.baselineTrophies,baselineCapturedAt:member.baselineCapturedAt,baselineStatus:member.baselineStatus,apiSyncStatus:member.apiSyncStatus,publicProfileSettings:member.publicProfileSettings||{}},events:store.events.filter(e=>e.status==='PUBLISHED').map(({registrations,...e})=>({...e,registrationsCount:registrations?.length||0})),announcements:store.announcements.filter(a=>a.status==='PUBLISHED'&&a.visibility!=='PUBLIC')});}
+    if(req.method==='GET'&&url.pathname==='/api/member/me'){requirePermission(user,'member.self');const member=store.members.find(m=>m.id===user.memberId&&m.status==='ACTIVE');if(!member)throw httpError(404,'Perfil de membro não encontrado.');const battles=member.battleHistory||[];return sendJSON(res,200,{member:{...publicMember(member),gameNickname:member.gameNickname,playerTag:member.playerTag,baselineTrophies:member.baselineTrophies,baselineCapturedAt:member.baselineCapturedAt,baselineStatus:member.baselineStatus,apiSyncStatus:member.apiSyncStatus,apiSyncError:member.apiSyncError||null,playerStats:member.playerStats||null,brawlers:member.brawlers||[],trophyHistory:(member.trophyHistory||[]).slice(-60),battleStats:member.battleUsage?{...member.battleUsage,brawlers:Object.entries(member.battleUsage.brawlers||{}).map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count),modes:Object.entries(member.battleUsage.modes||{}).map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count)}:aggregateBattleStats(battles),recentBattleHistory:battles.slice().sort((a,b)=>String(b.battleTime||b.observedAt).localeCompare(String(a.battleTime||a.observedAt))).slice(0,12),publicProfileSettings:member.publicProfileSettings||{}},events:store.events.filter(e=>e.status==='PUBLISHED').map(({registrations,...e})=>({...e,registrationsCount:registrations?.length||0})),announcements:store.announcements.filter(a=>a.status==='PUBLISHED'&&a.visibility!=='PUBLIC')});}
     if(req.method==='POST'&&url.pathname==='/api/member/profile'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const member=store.members.find(m=>m.id===user.memberId&&m.status==='ACTIVE');if(!member)throw httpError(404,'Perfil de membro não encontrado.');const displayName=safeText(body.displayName,40),gameNickname=safeText(body.gameNickname,40);if(!displayName||!gameNickname)throw httpError(400,'Nome de exibição e nickname são obrigatórios.');await mutate(()=>{member.displayName=displayName;member.gameNickname=gameNickname;member.publicProfileSettings={...(member.publicProfileSettings||{}),public:body.public===true,showNickname:body.showNickname===true,showTag:body.showTag===true,showEvolution:body.showEvolution===true};audit(user,'Perfil pessoal atualizado',member.displayName);});return sendJSON(res,200,{ok:true});}
     if(req.method==='POST'&&url.pathname==='/api/member/privacy-request'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const request={id:id(),userId:user.id,memberId:user.memberId,type:safeText(body.type,20),details:safeText(body.details,1000),status:'OPEN',createdAt:nowISO()};await mutate(()=>{store.privacyRequests.unshift(request);audit(user,'Solicitação de privacidade criada',request.type);});return sendJSON(res,201,{ok:true});}
     if(req.method==='POST'&&url.pathname==='/api/member/event-registration'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const event=store.events.find(e=>e.id===body.eventId&&e.status==='PUBLISHED');if(!event)throw httpError(404,'Evento não encontrado.');await mutate(()=>{event.registrations=event.registrations||[];if(event.registrations.includes(user.memberId))return;if(event.limit&&event.registrations.length>=event.limit)throw httpError(409,'As vagas deste evento foram preenchidas.');event.registrations.push(user.memberId);audit(user,'Inscrição em evento',event.title);});return sendJSON(res,200,{ok:true});}
@@ -256,15 +494,85 @@ const server=http.createServer(async(req,res)=>{
       if(req.method==='GET'&&url.pathname==='/api/admin/announcements'){requirePermission(user,'announcements.write');return sendJSON(res,200,{items:store.announcements});}
       if(req.method==='GET'&&url.pathname==='/api/admin/audit'){requirePermission(user,'audit.read');return sendJSON(res,200,{items:store.audit.slice(0,300)});}
       if(req.method==='GET'&&url.pathname==='/api/admin/users'){requirePermission(user,'users.read');return sendJSON(res,200,{items:store.users.map(publicUser)});}
+      if(req.method==='GET'&&url.pathname==='/api/admin/account-requests'){
+        requirePermission(user,'users.read');
+        const items=store.accountRequests.slice().sort((a,b)=>(a.status==='PENDING'?-1:1)-(b.status==='PENDING'?-1:1)||String(b.createdAt).localeCompare(String(a.createdAt))).map(({salt,passwordHash,...r})=>r);
+        return sendJSON(res,200,{items});
+      }
+      const approveAccount=url.pathname.match(/^\/api\/admin\/account-requests\/([^/]+)\/approve$/);
+      if(req.method==='POST'&&approveAccount){
+        checkCsrf(req);requirePermission(user,'users.write');
+        let created=null;
+        await mutate(()=>{
+          const current=store.accountRequests.find(r=>r.id===approveAccount[1]);
+          if(!current||current.status!=='PENDING'||!current.passwordHash||!current.salt)throw httpError(409,'A solicitação não está mais pendente ou expirou.');
+          const member=store.members.find(m=>m.id===current.memberId&&m.status==='ACTIVE'&&cleanTag(m.playerTag)===cleanTag(current.playerTag));
+          if(!member)throw httpError(409,'O vínculo do jogador não está mais ativo. Revalide o cadastro do membro antes de aprovar.');
+          if(store.users.some(u=>u.email===current.email))throw httpError(409,'Este e-mail já foi utilizado por outra conta.');
+          if(store.users.some(u=>u.role==='MEMBER'&&u.memberId===member.id))throw httpError(409,'Este membro já possui uma conta vinculada.');
+          created={id:id(),name:member.displayName,email:current.email,role:'MEMBER',memberId:member.id,permissions:defaultPermissions('MEMBER'),salt:current.salt,passwordHash:current.passwordHash,createdAt:nowISO(),disabled:false};
+          store.users.push(created);current.status='APPROVED';current.reviewedAt=nowISO();current.reviewedBy=user.id;current.salt=null;current.passwordHash=null;
+          audit(user,'Conta de membro aprovada',`${member.displayName} • ${current.email}`);
+        });
+        return sendJSON(res,200,{ok:true,user:publicUser(created)});
+      }
+      const rejectAccount=url.pathname.match(/^\/api\/admin\/account-requests\/([^/]+)\/reject$/);
+      if(req.method==='POST'&&rejectAccount){
+        checkCsrf(req);requirePermission(user,'users.write');
+        const body=await bodyJSON(req,2000);const reason=safeText(body.reason,250);
+        const requestRecord=store.accountRequests.find(r=>r.id===rejectAccount[1]);
+        if(!requestRecord||requestRecord.status!=='PENDING')throw httpError(404,'Solicitação pendente não encontrada.');
+        await mutate(()=>{const current=store.accountRequests.find(r=>r.id===rejectAccount[1]);if(!current||current.status!=='PENDING')throw httpError(409,'A solicitação já foi analisada.');current.status='REJECTED';current.reviewedAt=nowISO();current.reviewedBy=user.id;current.reviewReason=reason;current.salt=null;current.passwordHash=null;audit(user,'Solicitação de conta rejeitada',`${current.displayName} • ${current.email} • ${reason}`);});
+        return sendJSON(res,200,{ok:true});
+      }
+
       if(req.method==='GET'&&url.pathname==='/api/admin/privacy'){requirePermission(user,'privacy.read');return sendJSON(res,200,{items:store.privacyRequests});}
       if(req.method==='GET'&&url.pathname==='/api/admin/settings'){requirePermission(user,'settings.write');return sendJSON(res,200,{settings:store.settings});}
-      if(req.method==='POST'&&url.pathname==='/api/admin/members'){checkCsrf(req);requirePermission(user,'members.write');const body=await bodyJSON(req,10000);const displayName=safeText(body.displayName,40),gameNickname=safeText(body.gameNickname,40),tag=cleanTag(body.playerTag),brawler=rosterEntry(body.brawlerId);if(!displayName||!gameNickname||!tag||!brawler)throw httpError(400,'Preencha nome, nickname, tag e Brawler.');if(!tagIsValid(tag))throw httpError(400,'Tag inválida.');if(body.whatsappConfirmed!==true)throw httpError(400,'Confirme a entrada manual no WhatsApp antes de ativar.');if(store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Esta tag já está cadastrada como membro ativo.');if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler já está reservado ou representado.');let api=null;try{api=await fetchPlayer(tag,true);}catch{}const member={id:id(),displayName,gameNickname,playerTag:tag,representedBrawlerId:brawler.id,representedBrawlerKey:brawler.key,representedBrawlerName:brawler.name,status:'ACTIVE',joinedAt:nowISO(),createdAt:nowISO(),publicProfileSettings:{public:true,showNickname:true,showTag:false,showEvolution:true},currentTrophies:api&&validNumber(api.player.trophies)?Number(api.player.trophies):null,currentTrophiesCapturedAt:api?.fetchedAt||null,baselineTrophies:api&&validNumber(api.player.trophies)?Number(api.player.trophies):null,baselineCapturedAt:api?.fetchedAt||null,baselineStatus:api?'CAPTURED':'PENDING_CAPTURE',apiSyncStatus:api?'OK':'PENDING',brawlers:api&&Array.isArray(api.player.brawlers)?api.player.brawlers.map(b=>({name:b.name,trophies:Number(b.trophies)||0,power:Number(b.power)||null,rank:Number(b.rank)||null})):[],recentBattles:api?(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,tag)})).filter(x=>x.brawlerName):[],applicationId:null};
-        await mutate(()=>{if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler foi reservado ou representado durante o cadastro.');if(store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Esta tag foi cadastrada por outra operação.');store.members.unshift(member);if(api)store.snapshots.push({id:id(),memberId:member.id,trophies:member.baselineTrophies,capturedAt:api.fetchedAt,source:'brawl-stars-api',syncStatus:'CAPTURED'});audit(user,'Membro cadastrado',`${displayName} • ${tag} • ${brawler.name}`);});return sendJSON(res,201,{ok:true,member:{id:member.id,displayName:member.displayName,baselineStatus:member.baselineStatus}});}
+      if(req.method==='POST'&&url.pathname==='/api/admin/members'){
+        checkCsrf(req);requirePermission(user,'members.write');
+        const body=await bodyJSON(req,10000);
+        const displayName=safeText(body.displayName,40),gameNickname=safeText(body.gameNickname,40),tag=cleanTag(body.playerTag),brawler=rosterEntry(body.brawlerId);
+        if(!displayName||!gameNickname||!tag||!brawler)throw httpError(400,'Preencha nome, nickname, tag e Brawler.');
+        if(!tagIsValid(tag))throw httpError(400,'Tag inválida.');
+        if(body.whatsappConfirmed!==true)throw httpError(400,'Confirme a entrada manual no WhatsApp antes de ativar.');
+        if(store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Esta tag já está cadastrada como membro ativo.');
+        if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler já está reservado ou representado.');
+        let api=null;try{api=await fetchPlayer(tag,true);}catch{}
+        const memberId=id();
+        const battleRecords=api?extractBattleRecords(api.battlelog,tag,memberId):[];
+        const member={id:memberId,displayName,gameNickname:api?.player?.name||gameNickname,playerTag:tag,representedBrawlerId:brawler.id,representedBrawlerKey:brawler.key,representedBrawlerName:brawler.name,status:'ACTIVE',joinedAt:nowISO(),createdAt:nowISO(),publicProfileSettings:{public:true,showNickname:true,showTag:false,showEvolution:true},currentTrophies:api&&validNumber(api.player.trophies)?Number(api.player.trophies):null,currentTrophiesCapturedAt:api?.fetchedAt||null,baselineTrophies:api&&validNumber(api.player.trophies)?Number(api.player.trophies):null,baselineCapturedAt:api?.fetchedAt||null,baselineStatus:api&&validNumber(api.player.trophies)?'CAPTURED':'PENDING_CAPTURE',apiSyncStatus:api?(api.battlelogAvailable?'OK':'PARTIAL'):'PENDING',apiSyncError:api?.battlelogError||null,playerStats:api?normalizePlayerStats(api.player):null,brawlers:api&&Array.isArray(api.player.brawlers)?api.player.brawlers.map(b=>({id:b.id??null,name:b.name,trophies:Number(b.trophies)||0,highestTrophies:validNumber(b.highestTrophies)?Number(b.highestTrophies):null,power:Number(b.power)||null,rank:Number(b.rank)||null})):[],recentBattles:api?(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,tag)})).filter(x=>x.brawlerName):[],applicationId:null};
+        await mutate(()=>{
+          if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler foi reservado ou representado durante o cadastro.');
+          if(store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Esta tag foi cadastrada por outra operação.');
+          member.battleHistory=[];member.battleUsage={totalObserved:0,wins:0,losses:0,draws:0,brawlers:{},modes:{}};applyBattleRecords(member,battleRecords);store.members.unshift(member);
+          if(member.baselineTrophies!==null)store.snapshots.push({id:id(),memberId:member.id,trophies:member.baselineTrophies,capturedAt:member.baselineCapturedAt,source:'brawl-stars-api',syncStatus:'CAPTURED'});
+          audit(user,'Membro cadastrado',`${displayName} • ${tag} • ${brawler.name}`);
+        });
+        return sendJSON(res,201,{ok:true,member:{id:member.id,displayName:member.displayName,baselineStatus:member.baselineStatus}});
+      }
       const transition=url.pathname.match(/^\/api\/admin\/applications\/([^/]+)\/transition$/);if(req.method==='POST'&&transition){checkCsrf(req);requirePermission(user,'applications.write');const body=await bodyJSON(req);const target=safeText(body.status,30);const app=store.applications.find(a=>a.id===transition[1]);if(!app)throw httpError(404,'Candidatura não encontrada.');const allowed={PENDING:['IN_REVIEW','CANCELLED'],IN_REVIEW:['NEEDS_INFORMATION','APPROVED','REJECTED','CANCELLED'],NEEDS_INFORMATION:['IN_REVIEW','REJECTED','CANCELLED'],APPROVED:['AWAITING_WHATSAPP','REJECTED','CANCELLED'],AWAITING_WHATSAPP:['REJECTED','CANCELLED']};if(!allowed[app.status]?.includes(target))throw httpError(409,`Transição não permitida: ${app.status} → ${target}.`);const originalStatus=app.status;await mutate(()=>{if(app.status!==originalStatus||!allowed[app.status]?.includes(target))throw httpError(409,'A candidatura foi atualizada por outra ação. Recarregue a lista.');app.status=target;app.updatedAt=nowISO();app.history.push({status:target,at:nowISO(),by:user.name,reason:safeText(body.reason,250)});if(['REJECTED','CANCELLED'].includes(target))app.reservationExpiresAt=null;audit(user,`Candidatura: ${target}`,`${app.displayName} • ${app.playerTag}`);});return sendJSON(res,200,{ok:true,status:target});}
-      const activate=url.pathname.match(/^\/api\/admin\/applications\/([^/]+)\/confirm-whatsapp$/);if(req.method==='POST'&&activate){checkCsrf(req);requirePermission(user,'applications.write');const body=await bodyJSON(req);const app=store.applications.find(a=>a.id===activate[1]);if(!app)throw httpError(404,'Candidatura não encontrada.');if(app.status!=='AWAITING_WHATSAPP')throw httpError(409,'A candidatura precisa estar aguardando confirmação do WhatsApp.');const brawler=rosterEntry(app.desiredBrawlerId??app.desiredBrawlerKey);if(!brawler||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A reserva do Brawler não está mais válida.');const member={id:id(),applicationId:app.id,displayName:app.displayName,gameNickname:app.gameNickname,playerTag:app.playerTag,representedBrawlerId:brawler.id,representedBrawlerKey:brawler.key,representedBrawlerName:brawler.name,status:'ACTIVE',joinedAt:nowISO(),createdAt:nowISO(),publicProfileSettings:{public:true,showNickname:true,showTag:false,showEvolution:true},currentTrophies:null,currentTrophiesCapturedAt:null,baselineTrophies:null,baselineCapturedAt:null,baselineStatus:'PENDING_CAPTURE',apiSyncStatus:'PENDING',brawlers:[],recentBattles:[]};const baseline=await captureBaseline(member);Object.assign(member,baseline.updates);await mutate(()=>{if(app.status!=='AWAITING_WHATSAPP'||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura ou a reserva mudou durante a ativação. Recarregue a lista.');app.status='ACTIVE';app.updatedAt=nowISO();app.history.push({status:'ACTIVE',at:nowISO(),by:user.name,reason:'Entrada no WhatsApp confirmada manualmente.'});app.reservationExpiresAt=null;store.members.unshift(member);store.snapshots.push(...baseline.snapshots);audit(user,'Membro ativado após WhatsApp',`${member.displayName} • ${member.playerTag}`);});return sendJSON(res,200,{ok:true,memberId:member.id,baselineStatus:member.baselineStatus});}
+      const activate=url.pathname.match(/^\/api\/admin\/applications\/([^/]+)\/confirm-whatsapp$/);
+      if(req.method==='POST'&&activate){
+        checkCsrf(req);requirePermission(user,'applications.write');
+        const body=await bodyJSON(req);
+        const app=store.applications.find(a=>a.id===activate[1]);
+        if(!app)throw httpError(404,'Candidatura não encontrada.');
+        if(app.status!=='AWAITING_WHATSAPP')throw httpError(409,'A candidatura precisa estar aguardando confirmação do WhatsApp.');
+        const brawler=rosterEntry(app.desiredBrawlerId??app.desiredBrawlerKey);
+        if(!brawler||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A reserva do Brawler não está mais válida.');
+        const member={id:id(),applicationId:app.id,displayName:app.displayName,gameNickname:app.gameNickname,playerTag:app.playerTag,representedBrawlerId:brawler.id,representedBrawlerKey:brawler.key,representedBrawlerName:brawler.name,status:'ACTIVE',joinedAt:nowISO(),createdAt:nowISO(),publicProfileSettings:{public:true,showNickname:true,showTag:false,showEvolution:true},currentTrophies:null,currentTrophiesCapturedAt:null,baselineTrophies:null,baselineCapturedAt:null,baselineStatus:'PENDING_CAPTURE',apiSyncStatus:'PENDING',playerStats:null,brawlers:[],recentBattles:[]};
+        const baseline=await captureBaseline(member);Object.assign(member,baseline.updates);
+        await mutate(()=>{
+          if(app.status!=='AWAITING_WHATSAPP'||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura ou a reserva mudou durante a ativação. Recarregue a lista.');
+          app.status='ACTIVE';app.updatedAt=nowISO();app.history.push({status:'ACTIVE',at:nowISO(),by:user.name,reason:'Entrada no WhatsApp confirmada manualmente.'});app.reservationExpiresAt=null;
+          member.battleHistory=[];member.battleUsage={totalObserved:0,wins:0,losses:0,draws:0,brawlers:{},modes:{}};applyBattleRecords(member,baseline.battleRecords||[]);store.members.unshift(member);store.snapshots.push(...baseline.snapshots);
+          audit(user,'Membro ativado após WhatsApp',`${member.displayName} • ${member.playerTag}`);
+        });
+        return sendJSON(res,200,{ok:true,memberId:member.id,baselineStatus:member.baselineStatus});
+      }
       const memberStatus=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/status$/);if(req.method==='POST'&&memberStatus){checkCsrf(req);requirePermission(user,'members.write');const body=await bodyJSON(req);const target=safeText(body.status,20);if(!['ACTIVE','SUSPENDED','LEFT'].includes(target))throw httpError(400,'Status de membro inválido.');const member=store.members.find(m=>m.id===memberStatus[1]);if(!member)throw httpError(404,'Membro não encontrado.');await mutate(()=>{if(target==='ACTIVE'&&brawlerState(member.representedBrawlerKey)!=='AVAILABLE'&&member.status!=='ACTIVE')throw httpError(409,'O Brawler deste membro foi reservado ou representado por outra pessoa.');const previous=member.status;member.status=target;member.statusUpdatedAt=nowISO();member.statusReason=safeText(body.reason,250);audit(user,`Status de membro: ${target}`,`${member.displayName} • ${previous} → ${target} • ${member.statusReason}`);});return sendJSON(res,200,{ok:true,status:target});}
       const baselineCorrection=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/baseline-correction$/);if(req.method==='POST'&&baselineCorrection){checkCsrf(req);requirePermission(user,'baseline.correct');const body=await bodyJSON(req);const value=Number(body.value),reason=safeText(body.reason,300);if(!Number.isInteger(value)||value<0||value>100000||reason.length<10)throw httpError(400,'Informe um baseline inteiro válido e uma justificativa com pelo menos 10 caracteres.');const member=store.members.find(m=>m.id===baselineCorrection[1]);if(!member)throw httpError(404,'Membro não encontrado.');await mutate(()=>{const previous=member.baselineTrophies;member.baselineTrophies=value;member.baselineStatus='CAPTURED';member.baselineCorrectedAt=nowISO();member.baselineCorrectionReason=reason;audit(user,'Correção excepcional de baseline',`${member.displayName}: ${previous??'pendente'} → ${value}. Motivo: ${reason}`);});return sendJSON(res,200,{ok:true});}
-      const syncMember=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/sync$/);if(req.method==='POST'&&syncMember){checkCsrf(req);requirePermission(user,'members.write');const m=store.members.find(x=>x.id===syncMember[1]&&x.status==='ACTIVE');if(!m)throw httpError(404,'Membro não encontrado.');const refresh=await refreshMember({id:m.id,displayName:m.displayName,playerTag:m.playerTag,gameNickname:m.gameNickname,baselineStatus:m.baselineStatus});await mutate(()=>{const current=store.members.find(x=>x.id===syncMember[1]&&x.status==='ACTIVE');if(!current)throw httpError(404,'Membro não encontrado.');Object.assign(current,refresh.updates);store.snapshots.push(...refresh.snapshots);audit(user,'Sincronização de jogador',`${current.displayName} • ${current.playerTag}`);});const updated=store.members.find(x=>x.id===syncMember[1]);return sendJSON(res,200,{ok:true,currentTrophies:updated?.currentTrophies??null,baselineStatus:updated?.baselineStatus||'PENDING_CAPTURE'});}
+      const syncMember=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/sync$/);if(req.method==='POST'&&syncMember){checkCsrf(req);requirePermission(user,'members.write');const m=store.members.find(x=>x.id===syncMember[1]&&x.status==='ACTIVE');if(!m)throw httpError(404,'Membro não encontrado.');const refresh=await refreshMember({id:m.id,displayName:m.displayName,playerTag:m.playerTag,gameNickname:m.gameNickname,baselineStatus:m.baselineStatus,currentTrophies:m.currentTrophies,currentTrophiesCapturedAt:m.currentTrophiesCapturedAt,trophyHistory:m.trophyHistory});await mutate(()=>{const current=store.members.find(x=>x.id===syncMember[1]&&x.status==='ACTIVE');if(!current)throw httpError(404,'Membro não encontrado.');const previous=current.currentTrophies;const previousAt=current.currentTrophiesCapturedAt;Object.assign(current,refresh.updates);const history=Array.isArray(current.trophyHistory)?current.trophyHistory.slice():[];if(!history.length&&validNumber(previous))history.push({trophies:Number(previous),capturedAt:previousAt||null,source:'profile-cache'});const next=refresh.updates.currentTrophies;if(validNumber(next)&&(!history.length||Number(history.at(-1).trophies)!==Number(next)))history.push({trophies:Number(next),capturedAt:refresh.updates.currentTrophiesCapturedAt,source:'brawl-stars-api'});current.trophyHistory=history.slice(-180);store.snapshots.push(...refresh.snapshots);const known=new Set((current.battleHistory||[]).map(b=>b.id));applyBattleRecords(current,(refresh.battleRecords||[]).filter(b=>!known.has(b.id)));store.snapshots=store.snapshots.slice(-50000);audit(user,'Sincronização de jogador',`${current.displayName} • ${current.playerTag}`);});const updated=store.members.find(x=>x.id===syncMember[1]);return sendJSON(res,200,{ok:true,currentTrophies:updated?.currentTrophies??null,baselineStatus:updated?.baselineStatus||'PENDING_CAPTURE',apiSyncStatus:updated?.apiSyncStatus||'PENDING'});}
       if(req.method==='POST'&&url.pathname==='/api/admin/events'){checkCsrf(req);requirePermission(user,'events.write');const body=await bodyJSON(req);const title=safeText(body.title,80),date=safeText(body.date,10);if(!title||!/^\d{4}-\d{2}-\d{2}$/.test(date))throw httpError(400,'Informe título e data válida.');const event={id:id(),title,date,time:safeText(body.time,5),type:safeText(body.type,30),limit:body.limit?Math.max(1,Math.min(500,Number(body.limit))):null,description:safeText(body.description,1200),status:body.status==='DRAFT'?'DRAFT':'PUBLISHED',registrations:[],createdAt:nowISO(),createdBy:user.id};await mutate(()=>{store.events.unshift(event);audit(user,'Evento criado',title);});return sendJSON(res,201,{ok:true});}
       const updateEvent=url.pathname.match(/^\/api\/admin\/events\/([^/]+)$/);if(req.method==='PUT'&&updateEvent){checkCsrf(req);requirePermission(user,'events.write');const body=await bodyJSON(req);const event=store.events.find(e=>e.id===updateEvent[1]);if(!event)throw httpError(404,'Evento não encontrado.');const title=safeText(body.title,80),date=safeText(body.date,10);if(!title||!/^\d{4}-\d{2}-\d{2}$/.test(date))throw httpError(400,'Informe título e data válida.');await mutate(()=>{event.title=title;event.date=date;event.time=safeText(body.time,5);event.type=safeText(body.type,30);event.limit=body.limit?Math.max(1,Math.min(500,Number(body.limit))):null;event.description=safeText(body.description,1200);event.status=body.status==='DRAFT'?'DRAFT':'PUBLISHED';event.updatedAt=nowISO();audit(user,'Evento atualizado',title);});return sendJSON(res,200,{ok:true});}
       const deleteEvent=url.pathname.match(/^\/api\/admin\/events\/([^/]+)$/);if(req.method==='DELETE'&&deleteEvent){checkCsrf(req);requirePermission(user,'events.write');await mutate(()=>{const e=store.events.find(x=>x.id===deleteEvent[1]);store.events=store.events.filter(x=>x.id!==deleteEvent[1]);audit(user,'Evento removido',e?.title||deleteEvent[1]);});return sendJSON(res,200,{ok:true});}
@@ -275,6 +583,15 @@ const server=http.createServer(async(req,res)=>{
       if(req.method==='POST'&&url.pathname==='/api/admin/users'){checkCsrf(req);if(user?.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas e convites.');const body=await bodyJSON(req);const name=safeText(body.name,60),email=safeText(body.email,180).toLowerCase(),password=String(body.password||''),role=safeText(body.role,20);if(!name||!email.includes('@')||password.length<12||!roles.has(role)||role==='OWNER')throw httpError(400,'Dados inválidos. Senha mínima de 12 caracteres; OWNER não pode ser criado por este formulário.');if(store.users.some(u=>u.email===email))throw httpError(409,'Já existe uma conta com este e-mail.');const salt=crypto.randomBytes(16).toString('hex');const passwordHash=(await scrypt(password,salt,64)).toString('hex');if(role!=='MEMBER'&&user.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas administrativas.');const memberId=safeText(body.memberId,80)||null;if(role==='MEMBER'&&(!memberId||!store.members.some(m=>m.id===memberId&&m.status==='ACTIVE')))throw httpError(400,'Associe a conta a um membro ativo.');const created={id:id(),name,email,role,memberId,permissions:defaultPermissions(role),salt,passwordHash,createdAt:nowISO(),disabled:false};await mutate(()=>{if(store.users.some(u=>u.email===email))throw httpError(409,'Já existe uma conta com este e-mail.');store.users.push(created);audit(user,'Conta criada',`${email} • ${role}`);});return sendJSON(res,201,{ok:true,user:publicUser(created)});}
       if(req.method==='POST'&&url.pathname==='/api/admin/settings'){checkCsrf(req);requirePermission(user,'settings.write');const body=await bodyJSON(req);await mutate(()=>{store.settings={...store.settings,recruitmentOpen:body.recruitmentOpen===true,showNickname:body.showNickname===true,showTag:body.showTag===true,showEvolution:body.showEvolution===true,reservationHours:Math.max(1,Math.min(336,Number(body.reservationHours)||72))};audit(user,'Configurações atualizadas','Preferências da House');});return sendJSON(res,200,{ok:true});}
       if(req.method==='POST'&&url.pathname==='/api/admin/messages/log'){checkCsrf(req);requirePermission(user,'messages.write');const body=await bodyJSON(req);const state=safeText(body.state,40);if(!['PREPARED','CHAT_OPENED','SENT_CONFIRMED_MANUALLY','CONTACT_CONFIRMED'].includes(state))throw httpError(400,'Estado de comunicação inválido.');const recipientType=body.recipientType==='member'?'member':'application';const recipientId=safeText(body.recipientId,80);const log={id:id(),recipientType,recipientId,state,template:safeText(body.template,40),createdAt:nowISO(),createdBy:user.id};await mutate(()=>{store.messageLogs.unshift(log);audit(user,`WhatsApp: ${state}`,`${recipientType} • ${recipientId}`);});return sendJSON(res,201,{ok:true});}
+      if(req.method==='POST'&&url.pathname==='/api/admin/sync-players'){
+        checkCsrf(req);requirePermission(user,'api.sync');
+        if(!API_TOKEN)throw httpError(503,'Configure BRAWL_STARS_API_TOKEN no Render antes de sincronizar jogadores.');
+        if(playerSyncInProgress)throw httpError(409,'Já existe uma sincronização de jogadores em andamento.');
+        if(Date.now()<apiCooldownUntil)throw httpError(429,'A API oficial está em pausa de segurança. Tente novamente após o horário informado no painel.');
+        syncAllMembers().then(result=>console.log('[STAR PARK] Sincronização manual finalizada:',result)).catch(error=>console.error('[STAR PARK] Sincronização manual falhou:',fmtError(error)));
+        await mutate(()=>audit(user,'Sincronização manual de todos os jogadores','Solicitada pelo painel de integração.'));
+        return sendJSON(res,202,{ok:true,queued:true,intervalSeconds:PLAYER_SYNC_INTERVAL_SECONDS,message:'Sincronização iniciada no servidor. Acompanhe o resultado nesta tela.'});
+      }
       if(req.method==='POST'&&url.pathname==='/api/admin/sync-brawlers'){checkCsrf(req);requirePermission(user,'api.sync');const result=await syncBrawlers();await mutate(()=>audit(user,'Catálogo visual sincronizado',`${result.count} Brawlers`));return sendJSON(res,200,result);}
       if(req.method==='POST'&&url.pathname==='/api/admin/privacy/resolve'){checkCsrf(req);requirePermission(user,'privacy.read');const body=await bodyJSON(req);const r=store.privacyRequests.find(x=>x.id===body.id);if(!r)throw httpError(404,'Solicitação não encontrada.');await mutate(()=>{r.status='REVIEWED';r.reviewedAt=nowISO();r.reviewedBy=user.id;audit(user,'Solicitação de privacidade analisada',r.type);});return sendJSON(res,200,{ok:true});}
       return sendJSON(res,404,{error:'Rota administrativa inexistente.'});
