@@ -40,3 +40,11 @@ O hash dos três principais arquivos de interface foi comparado com o ZIP origin
 - Executar deploy e testar com as contas/credenciais reais.
 
 Nenhuma senha, chave Firebase ou token Supercell foi incluído neste ZIP.
+
+## Correção do formulário de candidatura
+
+- Removido o bloqueio de cinco tentativas por hora do endpoint público de candidaturas. Tentativas com dados inválidos não impedem novas inscrições.
+- Mantidas validações de campos, tag, faixa etária, telefone, duplicidade de candidatura e disponibilidade do Brawler.
+- O telefone aceita números brasileiros com DDD sem exigir que a pessoa digite `+55`; o servidor normaliza o valor para E.164 antes de salvar.
+- O campo de telefone formata automaticamente números brasileiros enquanto a pessoa digita.
+- A limitação de tentativas do login administrativo e da consulta de jogadores permanece ativa.

@@ -20,6 +20,15 @@ test('catálogo público inclui o snapshot e os três lançamentos de novembro d
 
 test('candidatura rejeita faixa etária inválida sem criar reserva',async()=>{const r=await fetch(`${base}/api/applications`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:'Teste',gameNickname:'Teste',playerTag:'PYLQG',ageRange:'10-11',phone:'+5511999999999',phoneType:'self',desiredBrawlerId:'shelly',privacyAcknowledged:true})});assert.equal(r.status,400);});
 
+test('candidatura não bloqueia após tentativas inválidas e aceita telefone brasileiro sem código do país',async()=>{
+ for(let i=0;i<7;i++){
+  const invalid=await fetch(`${base}/api/applications`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:'Teste',gameNickname:'Teste',playerTag:`PYLQ${i}G`,ageRange:'10-11',phone:'11912345678',phoneType:'self',desiredBrawlerId:'colt',privacyAcknowledged:true})});
+  assert.equal(invalid.status,400);
+ }
+ const valid=await fetch(`${base}/api/applications`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:'Telefone Brasil',gameNickname:'Telefone Brasil',playerTag:'JY2P9',ageRange:'18-24',phone:'(11) 91234-5678',phoneType:'self',desiredBrawlerId:'colt',privacyAcknowledged:true})});
+ assert.equal(valid.status,201);
+});
+
 test('reserva de Brawler é atômica sob duas candidaturas simultâneas',async()=>{const make=(tag,name,phone)=>fetch(`${base}/api/applications`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:name,gameNickname:name,playerTag:tag,ageRange:'18-24',phone,phoneType:'self',desiredBrawlerId:'shelly',privacyAcknowledged:true})});const results=await Promise.all([make('PYLQG','Jogador A','+5511999999991'),make('QRGPL','Jogador B','+5511999999992')]);const statuses=results.map(r=>r.status).sort();assert.deepEqual(statuses,[201,409]);const roster=await (await fetch(`${base}/api/brawlers`)).json();assert.equal(roster.items.find(b=>b.key==='shelly').status,'RESERVED');});
 
 test('métricas não inventam troféus quando não há membros ativos',async()=>{const r=await fetch(`${base}/api/public/summary`);const s=await r.json();assert.equal(s.activeMembers,0);assert.equal(s.totalTrophies,null);assert.equal(s.mostUsedBrawler,null);});

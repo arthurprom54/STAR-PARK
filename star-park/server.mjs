@@ -49,7 +49,16 @@ const fmtError = (e) => e?.message || 'Não foi possível concluir a solicitaç�
 const safeText = (v,max=200) => String(v ?? '').trim().replace(/[\u0000-\u001f\u007f]/g,'').slice(0,max);
 const cleanTag = (v) => String(v || '').replace(/^#/,'').replace(/\s+/g,'').toUpperCase();
 const tagIsValid = (v) => /^[0289PYLQGRJCUV]{3,15}$/.test(cleanTag(v));
-const phoneIsValid = (v) => /^\+[1-9]\d{7,14}$/.test(String(v||'').replace(/[\s().-]/g,''));
+function normalizePhone(value){
+  const raw=String(value||'').trim();
+  const hasPlus=raw.startsWith('+');
+  let digits=raw.replace(/\D/g,'');
+  if(!hasPlus){
+    if(/^\d{10,11}$/.test(digits))digits=`55${digits}`;
+    else if(!/^55\d{10,11}$/.test(digits))return null;
+  }
+  return /^[1-9]\d{7,14}$/.test(digits)?`+${digits}`:null;
+}
 const validNumber = (v) => v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));
 const activeStatuses = new Set(['PENDING','IN_REVIEW','NEEDS_INFORMATION','APPROVED','AWAITING_WHATSAPP']);
 const allowedAgeRanges = new Set(['12-14','15-17','18-24','25+']);
@@ -219,9 +228,9 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&url.pathname==='/api/public/announcements')return sendJSON(res,200,{items:store.announcements.filter(a=>a.status==='PUBLISHED'&&a.visibility==='PUBLIC').sort((a,b)=>Number(b.pinned)-Number(a.pinned)||b.createdAt.localeCompare(a.createdAt))});
     if(req.method==='GET'&&url.pathname==='/api/public/settings')return sendJSON(res,200,{recruitmentOpen:store.settings.recruitmentOpen,recruitmentClosedMessage:store.settings.recruitmentClosedMessage});
     if(req.method==='POST'&&url.pathname==='/api/applications'){
-      rateLimit(req,'applications',5,60*60*1000);const body=await bodyJSON(req,12000);if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');
-      const displayName=safeText(body.displayName,40),gameNickname=safeText(body.gameNickname,40),tag=cleanTag(body.playerTag),ageRange=safeText(body.ageRange,8),phone=String(body.phone||'').replace(/[\s().-]/g,''),phoneType=body.phoneType==='guardian'?'guardian':'self',brawler=rosterEntry(body.desiredBrawlerId),motivation=safeText(body.motivation,500);
-      if(body.privacyAcknowledged!==true)throw httpError(400,'É necessário confirmar a leitura do aviso de privacidade.');if(!displayName||!gameNickname||!tag||!ageRange||!phone||!brawler)throw httpError(400,'Preencha todos os campos obrigatórios.');if(!tagIsValid(tag))throw httpError(400,'Tag inválida. Confira os caracteres permitidos.');if(!allowedAgeRanges.has(ageRange))throw httpError(400,'Faixa etária inválida.');if(!phoneIsValid(phone))throw httpError(400,'Telefone inválido. Use o formato internacional, por exemplo +5511999999999.');
+      const body=await bodyJSON(req,12000);if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');
+      const displayName=safeText(body.displayName,40),gameNickname=safeText(body.gameNickname,40),tag=cleanTag(body.playerTag),ageRange=safeText(body.ageRange,8),phone=normalizePhone(body.phone),phoneType=body.phoneType==='guardian'?'guardian':'self',brawler=rosterEntry(body.desiredBrawlerId),motivation=safeText(body.motivation,500);
+      if(body.privacyAcknowledged!==true)throw httpError(400,'É necessário confirmar a leitura do aviso de privacidade.');if(!displayName||!gameNickname||!tag||!ageRange||!brawler)throw httpError(400,'Preencha todos os campos obrigatórios.');if(!tagIsValid(tag))throw httpError(400,'Tag inválida. Confira os caracteres permitidos.');if(!allowedAgeRanges.has(ageRange))throw httpError(400,'Faixa etária inválida.');if(!phone)throw httpError(400,'Telefone inválido. Digite um número brasileiro com DDD, por exemplo (11) 91234-5678, ou informe o código do país.');
       if(store.applications.some(a=>cleanTag(a.playerTag)===tag&&activeStatuses.has(a.status))||store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Já existe uma candidatura ativa ou vínculo cadastrado para esta tag.');
       if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler acabou de ser reservado ou representado. Escolha outro.');
       let apiLookupStatus='PENDING',trophiesAtApplication=null,applicationTrophiesCapturedAt=null,verifiedNickname=gameNickname;
