@@ -1,0 +1,675 @@
+name: STAR PARK - Persistência confiável e candidaturas
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: star-park-firestore-hardening
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    name: Corrigir e validar persistência
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Criar branch isolada
+        shell: bash
+        run: |
+          git switch -c "automation/firestore-reliability-${GITHUB_RUN_NUMBER}"
+          echo "PATCH_BRANCH=automation/firestore-reliability-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Aplicar correção com proteções obrigatórias
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          store_module = r'''
+          export const STORE_COLLECTIONS = Object.freeze([
+            'users', 'applications', 'members', 'events', 'announcements', 'audit',
+            'privacyRequests', 'snapshots', 'messageLogs', 'accountRequests',
+          ]);
+
+          const REVISION_COLLECTION = '_system';
+          const REVISION_DOCUMENT = 'store';
+          const MAX_TRANSACTION_WRITES = 450;
+          const MAX_DOCUMENT_BYTES = 900_000;
+
+          const clone = (value) => JSON.parse(JSON.stringify(value));
+
+          function stable(value) {
+            if (Array.isArray(value)) return value.map(stable);
+            if (value && typeof value === 'object') {
+              return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+            }
+            return value;
+          }
+
+          const same = (a, b) => JSON.stringify(stable(a)) === JSON.stringify(stable(b));
+
+          function defaults(defaultStore) {
+            const base = defaultStore();
+            for (const name of STORE_COLLECTIONS) if (!Array.isArray(base[name])) base[name] = [];
+            return base;
+          }
+
+          function readRevision(snapshot) {
+            const revision = Number(snapshot?.exists ? snapshot.data()?.revision ?? 0 : 0);
+            if (!Number.isSafeInteger(revision) || revision < 0) {
+              throw new Error('A revisão de persistência do Firestore está inválida.');
+            }
+            return revision;
+          }
+
+          function snapshotToStore(querySnapshots, settingsSnapshot, defaultStore, revision) {
+            const data = defaults(defaultStore);
+            STORE_COLLECTIONS.forEach((name, index) => {
+              data[name] = querySnapshots[index].docs.map((doc) => ({ ...doc.data(), id: doc.id }));
+            });
+            if (settingsSnapshot.exists) data.settings = { ...data.settings, ...settingsSnapshot.data() };
+            data.__firestoreRevision = revision;
+            return data;
+          }
+
+          async function readAllStoreData(transaction, db, defaultStore, revision) {
+            const [querySnapshots, settingsSnapshot] = await Promise.all([
+              Promise.all(STORE_COLLECTIONS.map((name) => transaction.get(db.collection(name)))),
+              transaction.get(db.collection('settings').doc('main')),
+            ]);
+            return snapshotToStore(querySnapshots, settingsSnapshot, defaultStore, revision);
+          }
+
+          /** Loads a transactionally consistent startup snapshot and its shared revision. */
+          export async function loadStoreFromFirestore(db, defaultStore) {
+            const revisionRef = db.collection(REVISION_COLLECTION).doc(REVISION_DOCUMENT);
+            return db.runTransaction(async (transaction) => {
+              const revision = readRevision(await transaction.get(revisionRef));
+              return readAllStoreData(transaction, db, defaultStore, revision);
+            }, { maxAttempts: 8 });
+          }
+
+          /** Refreshes a server instance only when another instance has advanced the shared revision. */
+          export async function refreshStoreFromFirestoreIfChanged(db, targetStore, defaultStore) {
+            const revisionRef = db.collection(REVISION_COLLECTION).doc(REVISION_DOCUMENT);
+            const remoteRevision = readRevision(await revisionRef.get());
+            const localRevision = Number.isSafeInteger(targetStore.__firestoreRevision)
+              ? targetStore.__firestoreRevision
+              : -1;
+            if (remoteRevision === localRevision) return false;
+            const latest = await loadStoreFromFirestore(db, defaultStore);
+            syncStoreObject(targetStore, latest);
+            return true;
+          }
+
+          /**
+           * Keeps references to existing objects so routes holding an object reference remain valid.
+           * The internal revision is kept in memory and is never written into business collections.
+           */
+          export function syncStoreObject(target, source) {
+            for (const name of STORE_COLLECTIONS) {
+              const existing = new Map((target[name] || []).map((item) => [item.id, item]));
+              target[name] = (source[name] || []).map((incoming) => {
+                const current = existing.get(incoming.id);
+                if (!current) return clone(incoming);
+                for (const key of Object.keys(current)) delete current[key];
+                Object.assign(current, clone(incoming));
+                return current;
+              });
+            }
+            target.settings = { ...(source.settings || {}) };
+            target.__firestoreRevision = Number(source.__firestoreRevision ?? 0);
+          }
+
+          function collectChanges(before, after) {
+            const changes = [];
+            for (const name of STORE_COLLECTIONS) {
+              const oldById = new Map((before[name] || []).map((item) => [item.id, item]));
+              const newById = new Map((after[name] || []).map((item) => [item.id, item]));
+              for (const [docId] of oldById) {
+                if (!newById.has(docId)) changes.push({ type: 'delete', collection: name, id: docId });
+              }
+              for (const [docId, value] of newById) {
+                const oldValue = oldById.get(docId);
+                if (!oldById.has(docId) || !same(oldValue, value)) {
+                  changes.push({ type: 'set', collection: name, id: docId, data: value });
+                }
+              }
+            }
+            if (!same(before.settings || {}, after.settings || {})) {
+              changes.push({ type: 'set', collection: 'settings', id: 'main', data: after.settings || {} });
+            }
+            return changes;
+          }
+
+          /**
+           * Executes a mutation under a shared Firestore revision lock.
+           * A normal write reads one metadata document and persists only the changed records.
+           * If another server instance has committed since this instance last synchronized,
+           * the store is refreshed inside the same transaction before the callback is re-applied.
+           *
+           * The callback may be re-applied after a transaction retry. Keep it limited to in-memory
+           * store changes; do not perform network calls, send messages, or other external side effects
+           * inside it. The STAR PARK routes currently use it only for in-memory mutations.
+           */
+          export async function mutateStoreInFirestore(db, targetStore, fn, defaultStore) {
+            const initialSnapshot = clone(targetStore);
+            const expectedRevision = Number.isSafeInteger(targetStore.__firestoreRevision)
+              ? targetStore.__firestoreRevision
+              : -1;
+            const revisionRef = db.collection(REVISION_COLLECTION).doc(REVISION_DOCUMENT);
+            let rollbackSnapshot = initialSnapshot;
+
+            try {
+              const committed = await db.runTransaction(async (transaction) => {
+                const revision = readRevision(await transaction.get(revisionRef));
+                let latest;
+
+                if (revision === expectedRevision) {
+                  // Reuse the in-memory snapshot: no collection reads on the normal write path.
+                  latest = clone(initialSnapshot);
+                  latest.__firestoreRevision = revision;
+                } else {
+                  // Another process wrote since this instance's last successful mutation.
+                  // Refresh inside this transaction so validation and persistence share one snapshot.
+                  latest = await readAllStoreData(transaction, db, defaultStore, revision);
+                }
+
+                rollbackSnapshot = clone(latest);
+                syncStoreObject(targetStore, latest);
+                const before = clone(latest);
+                const result = await fn();
+                const after = clone(targetStore);
+                const changes = collectChanges(before, after);
+
+                if (changes.length > MAX_TRANSACTION_WRITES) {
+                  throw new Error(`Esta operação alteraria mais de ${MAX_TRANSACTION_WRITES} documentos. Divida a operação em lotes.`);
+                }
+
+                for (const change of changes) {
+                  const ref = db.collection(change.collection).doc(change.id);
+                  if (change.type === 'delete') {
+                    transaction.delete(ref);
+                    continue;
+                  }
+                  const size = Buffer.byteLength(JSON.stringify(change.data), 'utf8');
+                  if (size > MAX_DOCUMENT_BYTES) {
+                    throw new Error(`O registro ${change.collection}/${change.id} está próximo do limite de tamanho de um documento Firestore.`);
+                  }
+                  transaction.set(ref, change.data);
+                }
+
+                const nextRevision = revision + 1;
+                transaction.set(revisionRef, { revision: nextRevision, updatedAt: new Date().toISOString() });
+                return { result, revision: nextRevision };
+              }, { maxAttempts: 8 });
+
+              targetStore.__firestoreRevision = committed.revision;
+              return committed.result;
+            } catch (error) {
+              syncStoreObject(targetStore, rollbackSnapshot);
+              throw error;
+            }
+          }
+          '''
+          tests_module = r'''
+          import test from 'node:test';
+          import assert from 'node:assert/strict';
+          import { STORE_COLLECTIONS, loadStoreFromFirestore, mutateStoreInFirestore, refreshStoreFromFirestoreIfChanged } from '../lib/firestore-store.mjs';
+
+          const META_COLLECTION = '_system';
+          const META_DOCUMENT = 'store';
+          const SETTINGS_COLLECTION = 'settings';
+
+          class FakeDocumentSnapshot {
+            constructor(id, value) { this.id = id; this.value = value; this.exists = value !== undefined; }
+            data() { return this.value; }
+          }
+
+          class FakeQuerySnapshot {
+            constructor(docs) { this.docs = docs; this.empty = docs.length === 0; }
+          }
+
+          class FakeDocumentReference {
+            constructor(db, collectionName, id) {
+              this.db = db;
+              this.collectionName = collectionName;
+              this.name = collectionName;
+              this.id = id;
+              this.kind = 'document';
+            }
+            async get() { return new FakeDocumentSnapshot(this.id, this.db.data.get(this.collectionName)?.get(this.id)); }
+          }
+
+          class FakeCollectionReference {
+            constructor(db, name) { this.db = db; this.name = name; this.kind = 'collection'; }
+            doc(id) { return new FakeDocumentReference(this.db, this.name, id); }
+          }
+
+          class FakeFirestore {
+            constructor() {
+              this.data = new Map([...STORE_COLLECTIONS, SETTINGS_COLLECTION, META_COLLECTION]
+                .map((name) => [name, new Map()]));
+              this.collectionReads = 0;
+              this.failNextCommit = false;
+            }
+
+            collection(name) {
+              if (!this.data.has(name)) this.data.set(name, new Map());
+              return new FakeCollectionReference(this, name);
+            }
+
+            async runTransaction(callback, options = {}) {
+              const maxAttempts = options.maxAttempts || 5;
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const writes = [];
+                const validations = [];
+                const transaction = {
+                  get: async (ref) => {
+                    const collection = this.data.get(ref.name || ref.collectionName) || new Map();
+                    if (ref.kind === 'collection') {
+                      this.collectionReads += 1;
+                      const captured = [...collection].map(([id, value]) => [id, structuredClone(value)]);
+                      validations.push(() => {
+                        const current = [...(this.data.get(ref.name) || new Map())].map(([id, value]) => [id, structuredClone(value)]);
+                        return JSON.stringify(current) === JSON.stringify(captured);
+                      });
+                      return new FakeQuerySnapshot(captured.map(([id, value]) => ({ id, data: () => value })));
+                    }
+                    const captured = collection.has(ref.id) ? structuredClone(collection.get(ref.id)) : undefined;
+                    validations.push(() => {
+                      const current = this.data.get(ref.collectionName)?.get(ref.id);
+                      return JSON.stringify(current ?? null) === JSON.stringify(captured ?? null);
+                    });
+                    return new FakeDocumentSnapshot(ref.id, captured);
+                  },
+                  set: (ref, value) => writes.push({ type: 'set', ref, value: structuredClone(value) }),
+                  delete: (ref) => writes.push({ type: 'delete', ref }),
+                };
+
+                const result = await callback(transaction);
+                if (this.failNextCommit) {
+                  this.failNextCommit = false;
+                  throw new Error('falha simulada de commit');
+                }
+                if (!validations.every((validate) => validate())) continue;
+                for (const write of writes) {
+                  const collection = this.data.get(write.ref.collectionName);
+                  if (write.type === 'delete') collection.delete(write.ref.id);
+                  else collection.set(write.ref.id, write.value);
+                }
+                return result;
+              }
+              throw new Error('ABORTED: limite de tentativas da transação excedido');
+            }
+          }
+
+          const makeStore = () => ({
+            users: [], applications: [], members: [], events: [], announcements: [], audit: [],
+            privacyRequests: [], snapshots: [], messageLogs: [], accountRequests: [],
+            settings: { recruitmentOpen: true, recruitmentClosedMessage: 'Inscrições fechadas.', reservationHours: 72 },
+          });
+
+          const revisionOf = (db) => db.data.get(META_COLLECTION).get(META_DOCUMENT)?.revision ?? 0;
+
+          test('carrega uma fotografia consistente, configurações e revisão do Firestore', async () => {
+            const db = new FakeFirestore();
+            db.data.get('members').set('m1', { displayName: 'Membro' });
+            db.data.get('settings').set('main', { recruitmentOpen: false, reservationHours: 48 });
+            db.data.get(META_COLLECTION).set(META_DOCUMENT, { revision: 7 });
+
+            const loaded = await loadStoreFromFirestore(db, makeStore);
+            assert.equal(loaded.members.length, 1);
+            assert.equal(loaded.members[0].id, 'm1');
+            assert.equal(loaded.settings.recruitmentOpen, false);
+            assert.equal(loaded.settings.reservationHours, 48);
+            assert.equal(loaded.__firestoreRevision, 7);
+            assert.equal(db.collectionReads, STORE_COLLECTIONS.length);
+          });
+
+          test('grava apenas documentos alterados sem reler todas as coleções em cada mutação', async () => {
+            const db = new FakeFirestore();
+            db.data.get('members').set('m1', { displayName: 'Nome antigo', status: 'ACTIVE' });
+            const store = await loadStoreFromFirestore(db, makeStore);
+            const heldMember = store.members[0];
+            db.collectionReads = 0;
+
+            await mutateStoreInFirestore(db, store, () => {
+              store.members[0].displayName = 'Nome novo';
+              store.settings.recruitmentOpen = false;
+              store.audit.push({ id: 'a1', action: 'Teste' });
+            }, makeStore);
+
+            assert.equal(db.collectionReads, 0);
+            assert.equal(store.members[0], heldMember);
+            assert.equal(db.data.get('members').get('m1').displayName, 'Nome novo');
+            assert.equal(db.data.get('settings').get('main').recruitmentOpen, false);
+            assert.equal(db.data.get('audit').get('a1').action, 'Teste');
+            assert.equal(revisionOf(db), 1);
+
+            await mutateStoreInFirestore(db, store, () => {
+              store.events.push({ id: 'e1', title: 'Evento' });
+            }, makeStore);
+            assert.equal(db.collectionReads, 0, 'a segunda gravação também não deve reler coleções');
+            assert.equal(revisionOf(db), 2);
+          });
+
+
+          test('checagem de revisão detecta mudanças externas e evita releitura quando nada mudou', async () => {
+            const db = new FakeFirestore();
+            const first = await loadStoreFromFirestore(db, makeStore);
+            const second = await loadStoreFromFirestore(db, makeStore);
+            db.collectionReads = 0;
+
+            assert.equal(await refreshStoreFromFirestoreIfChanged(db, second, makeStore), false);
+            assert.equal(db.collectionReads, 0);
+
+            await mutateStoreInFirestore(db, first, () => {
+              first.applications.push({ id: 'app-refresh', status: 'PENDING' });
+            }, makeStore);
+
+            assert.equal(await refreshStoreFromFirestoreIfChanged(db, second, makeStore), true);
+            assert.equal(second.applications.some((application) => application.id === 'app-refresh'), true);
+            assert.equal(db.collectionReads, STORE_COLLECTIONS.length);
+            db.collectionReads = 0;
+            assert.equal(await refreshStoreFromFirestoreIfChanged(db, second, makeStore), false);
+            assert.equal(db.collectionReads, 0);
+          });
+
+          test('instância desatualizada recarrega dados no mesmo transaction antes de mutar', async () => {
+            const db = new FakeFirestore();
+            const first = await loadStoreFromFirestore(db, makeStore);
+            const second = await loadStoreFromFirestore(db, makeStore);
+            db.collectionReads = 0;
+
+            await mutateStoreInFirestore(db, first, () => {
+              first.members.push({ id: 'm1', displayName: 'Criado pela primeira instância' });
+            }, makeStore);
+            assert.equal(db.collectionReads, 0);
+
+            await mutateStoreInFirestore(db, second, () => {
+              assert.equal(second.members.some((member) => member.id === 'm1'), true);
+              second.audit.push({ id: 'a1', action: 'Segunda instância sincronizada' });
+            }, makeStore);
+
+            assert.equal(db.collectionReads, STORE_COLLECTIONS.length);
+            assert.equal(db.data.get('members').has('m1'), true);
+            assert.equal(db.data.get('audit').has('a1'), true);
+            assert.equal(second.members.some((member) => member.id === 'm1'), true);
+            assert.equal(revisionOf(db), 2);
+          });
+
+          test('instância desatualizada revalida recrutamento fechado antes de gravar', async () => {
+            const db = new FakeFirestore();
+            const first = await loadStoreFromFirestore(db, makeStore);
+            const second = await loadStoreFromFirestore(db, makeStore);
+
+            await mutateStoreInFirestore(db, first, () => {
+              first.settings.recruitmentOpen = false;
+            }, makeStore);
+
+            await assert.rejects(() => mutateStoreInFirestore(db, second, () => {
+              if (!second.settings.recruitmentOpen) throw new Error('RECRUTAMENTO_FECHADO');
+              second.applications.push({ id: 'app1', desiredBrawlerKey: 'shelly' });
+            }, makeStore), /RECRUTAMENTO_FECHADO/);
+            assert.equal(second.settings.recruitmentOpen, false);
+            assert.equal(db.data.get('applications').size, 0);
+            assert.equal(revisionOf(db), 1);
+          });
+
+          test('instância desatualizada revalida reserva de Brawler antes de gravar', async () => {
+            const db = new FakeFirestore();
+            const first = await loadStoreFromFirestore(db, makeStore);
+            const second = await loadStoreFromFirestore(db, makeStore);
+
+            await mutateStoreInFirestore(db, first, () => {
+              first.applications.push({ id: 'app1', status: 'PENDING', desiredBrawlerKey: 'shelly' });
+            }, makeStore);
+
+            await assert.rejects(() => mutateStoreInFirestore(db, second, () => {
+              const alreadyReserved = second.applications.some((application) =>
+                ['PENDING', 'IN_REVIEW', 'NEEDS_INFORMATION', 'APPROVED', 'AWAITING_WHATSAPP'].includes(application.status)
+                && application.desiredBrawlerKey === 'shelly');
+              if (alreadyReserved) throw new Error('BRAWLER_RESERVADO');
+              second.applications.push({ id: 'app2', status: 'PENDING', desiredBrawlerKey: 'shelly' });
+            }, makeStore), /BRAWLER_RESERVADO/);
+
+            assert.equal(db.data.get('applications').size, 1);
+            assert.equal(second.applications.length, 1);
+            assert.equal(revisionOf(db), 1);
+          });
+
+
+          test('duas candidaturas simultâneas não conseguem reservar o mesmo Brawler', async () => {
+            const db = new FakeFirestore();
+            const first = await loadStoreFromFirestore(db, makeStore);
+            const second = await loadStoreFromFirestore(db, makeStore);
+
+            const attempt = (store, applicationId) => mutateStoreInFirestore(db, store, () => {
+              const reserved = store.applications.some((application) =>
+                ['PENDING', 'IN_REVIEW', 'NEEDS_INFORMATION', 'APPROVED', 'AWAITING_WHATSAPP'].includes(application.status)
+                && application.desiredBrawlerKey === 'shelly');
+              if (reserved) throw new Error('BRAWLER_RESERVADO');
+              store.applications.push({ id: applicationId, status: 'PENDING', desiredBrawlerKey: 'shelly' });
+            }, makeStore);
+
+            const results = await Promise.allSettled([attempt(first, 'app-a'), attempt(second, 'app-b')]);
+            assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+            assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+            assert.equal(db.data.get('applications').size, 1);
+            assert.equal(revisionOf(db), 1);
+          });
+
+          test('fechar recrutamento ao mesmo tempo que chega candidatura impede a gravação', async () => {
+            const db = new FakeFirestore();
+            const adminStore = await loadStoreFromFirestore(db, makeStore);
+            const publicStore = await loadStoreFromFirestore(db, makeStore);
+
+            const closeRecruitment = mutateStoreInFirestore(db, adminStore, () => {
+              adminStore.settings.recruitmentOpen = false;
+            }, makeStore);
+            const submitApplication = mutateStoreInFirestore(db, publicStore, () => {
+              if (!publicStore.settings.recruitmentOpen) throw new Error('RECRUTAMENTO_FECHADO');
+              publicStore.applications.push({ id: 'app-race', status: 'PENDING' });
+            }, makeStore);
+
+            const results = await Promise.allSettled([closeRecruitment, submitApplication]);
+            assert.equal(results[0].status, 'fulfilled');
+            assert.equal(results[1].status, 'rejected');
+            assert.match(String(results[1].reason), /RECRUTAMENTO_FECHADO/);
+            assert.equal(db.data.get('applications').size, 0);
+            assert.equal(db.data.get('settings').get('main').recruitmentOpen, false);
+          });
+
+          test('falha da função reverte alterações locais e não grava dados', async () => {
+            const db = new FakeFirestore();
+            const store = await loadStoreFromFirestore(db, makeStore);
+            await assert.rejects(() => mutateStoreInFirestore(db, store, () => {
+              store.members.push({ id: 'm-falha', displayName: 'Não persistir' });
+              throw new Error('falha simulada');
+            }, makeStore), /falha simulada/);
+            assert.equal(store.members.length, 0);
+            assert.equal(db.data.get('members').size, 0);
+            assert.equal(revisionOf(db), 0);
+          });
+
+          test('falha no commit Firestore restaura o estado em memória', async () => {
+            const db = new FakeFirestore();
+            const store = await loadStoreFromFirestore(db, makeStore);
+            db.failNextCommit = true;
+            await assert.rejects(() => mutateStoreInFirestore(db, store, () => {
+              store.members.push({ id: 'm-falha', displayName: 'Não persistir' });
+            }, makeStore), /falha simulada de commit/);
+            assert.equal(store.members.length, 0);
+            assert.equal(db.data.get('members').size, 0);
+            assert.equal(revisionOf(db), 0);
+          });
+
+
+          test('Firebase exige credenciais válidas e falha com mensagem clara', async () => {
+            const { createFirestoreDb } = await import('../lib/firebase-admin.mjs');
+            await assert.rejects(() => createFirestoreDb({}), /Configure FIREBASE_SERVICE_ACCOUNT_JSON/);
+            await assert.rejects(() => createFirestoreDb({ FIREBASE_SERVICE_ACCOUNT_JSON: 'null' }), /objeto JSON de conta de serviço/);
+          });
+          '''
+
+          server_path = Path('server.mjs')
+          server = server_path.read_text(encoding='utf-8')
+          package_path = Path('package.json')
+          package = package_path.read_text(encoding='utf-8')
+
+          # Nunca aplica a atualização se qualquer proteção obrigatória tiver sumido.
+          required_guards = [
+              "if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');",
+              "if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler acabou de ser reservado ou representado. Escolha outro.');",
+          ]
+          for guard in required_guards:
+              if guard not in server:
+                  raise SystemExit(f'ABORTADO: proteção obrigatória ausente em server.mjs: {guard}')
+
+          import_old = "import {loadStoreFromFirestore, mutateStoreInFirestore, syncStoreObject} from './lib/firestore-store.mjs';"
+          import_new = "import {loadStoreFromFirestore, mutateStoreInFirestore, refreshStoreFromFirestoreIfChanged, syncStoreObject} from './lib/firestore-store.mjs';"
+          if server.count(import_old) != 1:
+              raise SystemExit('ABORTADO: a linha de importação do Firestore mudou; revisão manual necessária.')
+          server = server.replace(import_old, import_new, 1)
+
+          queue_anchor = 'let storeQueue = Promise.resolve();'
+          queue_new = '''let storeQueue = Promise.resolve();
+          let lastStoreRefreshCheckAt=0;
+          let lastStoreRefreshError=null;
+          let lastStorePersistenceAt=null;
+          let lastStorePersistenceError=null;
+          const STORE_REVISION_CHECK_INTERVAL_MS=2000;'''
+          if server.count(queue_anchor) != 1:
+              raise SystemExit('ABORTADO: não foi possível localizar a fila de persistência.')
+          server = server.replace(queue_anchor, queue_new, 1)
+
+          mutate_old = "async function mutate(fn){const run=storeQueue.then(async()=>{if(firestoreDb)return mutateStoreInFirestore(firestoreDb,store,fn,defaultStore);const result=await fn();await saveStore();return result;});storeQueue=run.catch(()=>{});return run;}"
+          mutate_new = '''async function mutate(fn){const run=storeQueue.then(async()=>{if(firestoreDb){try{const result=await mutateStoreInFirestore(firestoreDb,store,fn,defaultStore);lastStorePersistenceAt=nowISO();lastStorePersistenceError=null;return result;}catch(error){lastStorePersistenceError=error.code||fmtError(error);console.error('[STAR PARK] Falha ao persistir no Firestore:',lastStorePersistenceError);throw error;}}const result=await fn();await saveStore();return result;});storeQueue=run.catch(()=>{});return run;}
+          async function refreshStoreIfNeeded(){if(!firestoreDb)return;const run=storeQueue.then(async()=>{if(Date.now()-lastStoreRefreshCheckAt<STORE_REVISION_CHECK_INTERVAL_MS){if(lastStoreRefreshError)throw lastStoreRefreshError;return;}lastStoreRefreshCheckAt=Date.now();try{const changed=await refreshStoreFromFirestoreIfChanged(firestoreDb,store,defaultStore);lastStoreRefreshError=null;if(changed)console.info('[STAR PARK] Dados atualizados a partir de outra instância. Revisão:',store.__firestoreRevision);}catch(error){lastStoreRefreshError=error;console.error('[STAR PARK] Falha ao verificar a revisão do Firestore:',error.code||fmtError(error));throw error;}});storeQueue=run.catch(()=>{});return run;}'''
+          if server.count(mutate_old) != 1:
+              raise SystemExit('ABORTADO: a função mutate mudou; revisão manual necessária.')
+          server = server.replace(mutate_old, mutate_new, 1)
+
+          request_anchor = "const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);\n  try{\n    if(req.method==='GET'&&url.pathname==='/api/health')"
+          request_new = "const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);\n  try{\n    if(firestoreDb&&url.pathname.startsWith('/api/')&&url.pathname!=='/api/health')await refreshStoreIfNeeded();\n    if(req.method==='GET'&&url.pathname==='/api/health')"
+          if server.count(request_anchor) != 1:
+              raise SystemExit('ABORTADO: não foi possível localizar o início do roteador HTTP.')
+          server = server.replace(request_anchor, request_new, 1)
+
+          # Revalida o fechamento no instante exato da gravação, depois de qualquer espera pela API do jogo.
+          application_anchor = "await mutate(()=>{if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler acabou de ser reservado ou representado. Escolha outro.');"
+          application_new = "await mutate(()=>{if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler acabou de ser reservado ou representado. Escolha outro.');"
+          if server.count(application_anchor) != 1:
+              raise SystemExit('ABORTADO: proteção de reserva da candidatura mudou; revisão manual necessária.')
+          server = server.replace(application_anchor, application_new, 1)
+
+          version_anchor = "const APP_VERSION = '5.0.2';"
+          if server.count(version_anchor) != 1:
+              raise SystemExit('ABORTADO: versão de server.mjs inesperada.')
+          server = server.replace(version_anchor, "const APP_VERSION = '5.0.3';", 1)
+
+          health_anchor = 'storageDriver:STORAGE_DRIVER});'
+          health_new = "storageDriver:STORAGE_DRIVER,storage:{configured:STORAGE_DRIVER==='firestore'?Boolean(firestoreDb):true,revision:store.__firestoreRevision??null,lastWriteAt:lastStorePersistenceAt,lastWriteHadError:Boolean(lastStorePersistenceError)}});"
+          if server.count(health_anchor) != 1:
+              raise SystemExit('ABORTADO: formato do endpoint de saúde mudou.')
+          server = server.replace(health_anchor, health_new, 1)
+
+          package_anchor = '"version": "5.0.2"'
+          if package.count(package_anchor) != 1:
+              raise SystemExit('ABORTADO: versão de package.json inesperada.')
+          package = package.replace(package_anchor, '"version": "5.0.3"', 1)
+
+          # Confirma novamente as duas travas no código resultante.
+          for guard in required_guards:
+              if guard not in server:
+                  raise SystemExit(f'ABORTADO: uma proteção obrigatória foi alterada: {guard}')
+          if application_new not in server:
+              raise SystemExit('ABORTADO: a validação final do recrutamento não foi instalada.')
+
+          Path('lib/firestore-store.mjs').write_text(store_module, encoding='utf-8')
+          Path('tests/firestore-store.test.mjs').write_text(tests_module, encoding='utf-8')
+          server_path.write_text(server, encoding='utf-8')
+          package_path.write_text(package, encoding='utf-8')
+
+          # CI permanente: testa toda PR e toda atualização da branch principal.
+          quality_workflow = '''name: STAR PARK - Testes automáticos
+
+          on:
+            pull_request:
+            push:
+              branches: [main]
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          jobs:
+            test:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-node@v4
+                  with:
+                    node-version: 22
+                - name: Instalar dependências
+                  run: npm install --no-package-lock --no-audit --no-fund
+                - name: Verificar sintaxe
+                  run: |
+                    node --check server.mjs
+                    node --check lib/firestore-store.mjs
+                - name: Executar testes
+                  run: npm test
+          '''
+          Path('.github/workflows/star-park-quality-checks.yml').write_text(quality_workflow, encoding='utf-8')
+          PY
+
+      - name: Instalar dependências
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Verificar sintaxe e testes
+        shell: bash
+        run: |
+          node --check server.mjs
+          node --check lib/firestore-store.mjs
+          npm test
+          git diff --check
+
+      - name: Criar Pull Request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json server.mjs lib/firestore-store.mjs tests/firestore-store.test.mjs .github/workflows/star-park-quality-checks.yml
+          git diff --cached --quiet && { echo "Nenhuma alteração foi gerada."; exit 1; }
+          git commit -m "fix: harden Firestore persistence and applications"
+          git push --set-upstream origin "$PATCH_BRANCH"
+          gh pr create \
+            --base main \
+            --head "$PATCH_BRANCH" \
+            --title "fix: tornar candidaturas e persistência do Firestore mais confiáveis" \
+            --body-file - <<'BODY'
+          ## O que muda
+          - Substitui leituras completas de todas as coleções em cada gravação por uma revisão compartilhada e escrita somente dos documentos alterados.
+          - Detecta instâncias desatualizadas e atualiza o estado antes de validar/gravar.
+          - Revalida recrutamento aberto no instante da gravação e mantém o bloqueio de Brawler reservado/representado.
+          - Restaura o estado em memória quando a gravação falha e registra falhas de persistência.
+          - Acrescenta testes de concorrência, rollback, sincronização e CI permanente.
+
+          Os testes são executados antes da abertura desta PR. Revise e mescle somente se os checks estiverem verdes.
+          BODY
