@@ -618,38 +618,6 @@ jobs:
               raise SystemExit('ABORTADO: asserção de versão do teste smoke mudou; revisão manual necessária.')
           smoke = smoke.replace(smoke_anchor, smoke_new, 1)
           smoke_path.write_text(smoke, encoding='utf-8')
-          
-          # CI permanente: testa toda PR e toda atualização da branch principal.
-          quality_workflow = '''name: STAR PARK - Testes automáticos
-
-          on:
-            pull_request:
-            push:
-              branches: [main]
-            workflow_dispatch:
-
-          permissions:
-            contents: read
-
-          jobs:
-            test:
-              runs-on: ubuntu-latest
-              steps:
-                - uses: actions/checkout@v4
-                - uses: actions/setup-node@v4
-                  with:
-                    node-version: 22
-                - name: Instalar dependências
-                  run: npm install --no-package-lock --no-audit --no-fund
-                - name: Verificar sintaxe
-                  run: |
-                    node --check server.mjs
-                    node --check lib/firestore-store.mjs
-                - name: Executar testes
-                  run: npm test
-          '''
-          Path('.github/workflows/star-park-quality-checks.yml').write_text(quality_workflow, encoding='utf-8')
-          PY
 
       - name: Instalar dependências
         run: npm install --no-package-lock --no-audit --no-fund
@@ -669,7 +637,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json server.mjs lib/firestore-store.mjs tests/firestore-store.test.mjs .github/workflows/star-park-quality-checks.yml
+          git add package.json server.mjs lib/firestore-store.mjs tests/firestore-store.test.mjs tests/smoke.test.mjs
           git diff --cached --quiet && { echo "Nenhuma alteração foi gerada."; exit 1; }
           git commit -m "fix: harden Firestore persistence and applications"
           git push --set-upstream origin "$PATCH_BRANCH"
