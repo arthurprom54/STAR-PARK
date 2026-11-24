@@ -608,6 +608,17 @@ jobs:
           server_path.write_text(server, encoding='utf-8')
           package_path.write_text(package, encoding='utf-8')
 
+          
+          # Corrige o teste para acompanhar a versão real do pacote.
+          smoke_path = Path('tests/smoke.test.mjs')
+          smoke = smoke_path.read_text(encoding='utf-8')
+          smoke_anchor = "assert.equal(h.appVersion,'5.0.2');"
+          smoke_new = "assert.equal(h.appVersion,JSON.parse(await fs.readFile(path.join(ROOT,'package.json'),'utf8')).version);"
+          if smoke.count(smoke_anchor) != 1:
+              raise SystemExit('ABORTADO: asserção de versão do teste smoke mudou; revisão manual necessária.')
+          smoke = smoke.replace(smoke_anchor, smoke_new, 1)
+          smoke_path.write_text(smoke, encoding='utf-8')
+          
           # CI permanente: testa toda PR e toda atualização da branch principal.
           quality_workflow = '''name: STAR PARK - Testes automáticos
 
