@@ -4,11 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {promisify} from 'node:util';
-import {loadStoreFromFirestore, mutateStoreInFirestore, syncStoreObject} from './lib/firestore-store.mjs';
+import {loadStoreFromFirestore, mutateStoreInFirestore, refreshStoreFromFirestoreIfChanged, syncStoreObject} from './lib/firestore-store.mjs';
 import {aggregateBattleStats, extractBattleRecords, normalizePlayerStats} from './lib/brawl-stats.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const APP_VERSION = '5.0.2';
+const APP_VERSION = '5.0.3';
 const PORT = Number(process.env.PORT || 4173);
 const API_BASE = (process.env.BRAWL_STARS_API_BASE || 'https://bsproxy.royaleapi.dev/v1').replace(/\/+$/, '');
 const CATALOG_API_URL = process.env.BRAWL_CATALOG_API_URL || 'https://api.brawlapi.com/v1/brawlers';
@@ -36,6 +36,11 @@ const scrypt = promisify(crypto.scrypt);
 const sessions = new Map();
 const requestWindows = new Map();
 let storeQueue = Promise.resolve();
+let lastStoreRefreshCheckAt=0;
+let lastStoreRefreshError=null;
+let lastStorePersistenceAt=null;
+let lastStorePersistenceError=null;
+const STORE_REVISION_CHECK_INTERVAL_MS=2000;
 let officialApiQueue = Promise.resolve();
 let nextOfficialApiRequestAt = 0;
 let firestoreDb = null;
@@ -99,7 +104,8 @@ function defaultPermissions(role){return rolePermissions[role]||[];}
 
 async function readJSON(file,fallback){try{return JSON.parse(await fs.readFile(file,'utf8'));}catch{return fallback;}}
 async function saveStore(){if(firestoreDb)throw new Error('saveStore local não pode ser usado com Firestore.');await fs.mkdir(DATA_DIR,{recursive:true});const temp=`${STORE_FILE}.${process.pid}.tmp`;await fs.writeFile(temp,JSON.stringify(store,null,2),{mode:0o600});await fs.rename(temp,STORE_FILE);}
-async function mutate(fn){const run=storeQueue.then(async()=>{if(firestoreDb)return mutateStoreInFirestore(firestoreDb,store,fn,defaultStore);const result=await fn();await saveStore();return result;});storeQueue=run.catch(()=>{});return run;}
+async function mutate(fn){const run=storeQueue.then(async()=>{if(firestoreDb){try{const result=await mutateStoreInFirestore(firestoreDb,store,fn,defaultStore);lastStorePersistenceAt=nowISO();lastStorePersistenceError=null;return result;}catch(error){lastStorePersistenceError=error.code||fmtError(error);console.error('[STAR PARK] Falha ao persistir no Firestore:',lastStorePersistenceError);throw error;}}const result=await fn();await saveStore();return result;});storeQueue=run.catch(()=>{});return run;}
+async function refreshStoreIfNeeded(){if(!firestoreDb)return;const run=storeQueue.then(async()=>{if(Date.now()-lastStoreRefreshCheckAt<STORE_REVISION_CHECK_INTERVAL_MS){if(lastStoreRefreshError)throw lastStoreRefreshError;return;}lastStoreRefreshCheckAt=Date.now();try{const changed=await refreshStoreFromFirestoreIfChanged(firestoreDb,store,defaultStore);lastStoreRefreshError=null;if(changed)console.info('[STAR PARK] Dados atualizados a partir de outra instância. Revisão:',store.__firestoreRevision);}catch(error){lastStoreRefreshError=error;console.error('[STAR PARK] Falha ao verificar a revisão do Firestore:',error.code||fmtError(error));throw error;}});storeQueue=run.catch(()=>{});return run;}
 const sleep=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
 async function syncAllMembers(){
   if(!API_TOKEN_VALID)return {ok:false,reason:'API_NOT_CONFIGURED'};
@@ -607,7 +613,8 @@ if(API_TOKEN_VALID){const firstPlayerSync=setTimeout(()=>syncAllMembers().catch(
 const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);
   try{
-    if(req.method==='GET'&&url.pathname==='/api/health')return sendJSON(res,200,{ok:true,appVersion:APP_VERSION,apiConfigured:API_TOKEN_VALID,brawlerCount:roster.length,catalogSource:rosterSource,catalogCount:roster.length,catalogLastSuccessfulSync:lastSuccessfulSync,catalogLastSyncError:lastSyncError,catalogAutomaticSyncHours:process.env.STAR_PARK_DISABLE_CATALOG_SYNC==='1'?null:CATALOG_SYNC_INTERVAL_HOURS,playerSync:{intervalSeconds:PLAYER_SYNC_INTERVAL_SECONDS,minRequestIntervalMs:API_MIN_REQUEST_INTERVAL_MS,lastSyncAt:lastPlayerSyncAt,lastError:lastPlayerSyncError,inProgress:playerSyncInProgress,durationMs:lastPlayerSyncDurationMs,activeMembers:store.members.filter(m=>m.status==='ACTIVE').length,updatedMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='OK').length,partialMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='PARTIAL').length,staleMembers:store.members.filter(m=>m.status==='ACTIVE'&&['STALE','RATE_LIMITED'].includes(m.apiSyncStatus)).length,apiCooldownUntil:apiCooldownUntil?new Date(apiCooldownUntil).toISOString():null},ownerConfigured:Boolean(OWNER_EMAIL&&OWNER_PASSWORD&&SESSION_SECRET),storageDriver:STORAGE_DRIVER});
+    if(firestoreDb&&url.pathname.startsWith('/api/')&&url.pathname!=='/api/health')await refreshStoreIfNeeded();
+    if(req.method==='GET'&&url.pathname==='/api/health')return sendJSON(res,200,{ok:true,appVersion:APP_VERSION,apiConfigured:API_TOKEN_VALID,brawlerCount:roster.length,catalogSource:rosterSource,catalogCount:roster.length,catalogLastSuccessfulSync:lastSuccessfulSync,catalogLastSyncError:lastSyncError,catalogAutomaticSyncHours:process.env.STAR_PARK_DISABLE_CATALOG_SYNC==='1'?null:CATALOG_SYNC_INTERVAL_HOURS,playerSync:{intervalSeconds:PLAYER_SYNC_INTERVAL_SECONDS,minRequestIntervalMs:API_MIN_REQUEST_INTERVAL_MS,lastSyncAt:lastPlayerSyncAt,lastError:lastPlayerSyncError,inProgress:playerSyncInProgress,durationMs:lastPlayerSyncDurationMs,activeMembers:store.members.filter(m=>m.status==='ACTIVE').length,updatedMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='OK').length,partialMembers:store.members.filter(m=>m.status==='ACTIVE'&&m.apiSyncStatus==='PARTIAL').length,staleMembers:store.members.filter(m=>m.status==='ACTIVE'&&['STALE','RATE_LIMITED'].includes(m.apiSyncStatus)).length,apiCooldownUntil:apiCooldownUntil?new Date(apiCooldownUntil).toISOString():null},ownerConfigured:Boolean(OWNER_EMAIL&&OWNER_PASSWORD&&SESSION_SECRET),storageDriver:STORAGE_DRIVER,storage:{configured:STORAGE_DRIVER==='firestore'?Boolean(firestoreDb):true,revision:store.__firestoreRevision??null,lastWriteAt:lastStorePersistenceAt,lastWriteHadError:Boolean(lastStorePersistenceError)}});
     if(req.method==='GET'&&url.pathname==='/api/brawlers')return sendJSON(res,200,{items:roster.map(b=>({...b,status:brawlerState(b.key),representative:memberForBrawler(b.key)?.displayName||null})),count:roster.length,source:rosterSource,lastSuccessfulSync,apiConfigured:API_TOKEN_VALID,catalogApiUrl:'https://api.brawlapi.com/v1/brawlers',lastSyncError});
     if(req.method==='GET'&&url.pathname==='/api/public/summary')return sendJSON(res,200,publicSummary());
     if(req.method==='GET'&&url.pathname==='/api/public/members')return sendJSON(res,200,{items:store.members.filter(m=>m.status==='ACTIVE'&&m.publicProfileSettings?.public!==false).map(publicMember)});
@@ -623,7 +630,7 @@ const server=http.createServer(async(req,res)=>{
       let apiLookupStatus='PENDING',trophiesAtApplication=null,applicationTrophiesCapturedAt=null,verifiedNickname=gameNickname;
       try{const api=await fetchPlayer(tag);apiLookupStatus='OK';trophiesAtApplication=validNumber(api.player.trophies)?Number(api.player.trophies):null;applicationTrophiesCapturedAt=api.fetchedAt;verifiedNickname=api.player.name||gameNickname;}catch(e){apiLookupStatus='UNAVAILABLE';}
       const application={id:id(),displayName,gameNickname:verifiedNickname,playerTag:tag,ageRange,phone,phoneType,desiredBrawlerId:brawler.id,desiredBrawlerKey:brawler.key,desiredBrawlerName:brawler.name,motivation,status:'PENDING',apiLookupStatus,trophiesAtApplication,applicationTrophiesCapturedAt,submittedAt:nowISO(),createdAt:nowISO(),updatedAt:nowISO(),privateNotes:[],history:[{status:'PENDING',at:nowISO(),by:'Sistema'}],reservationExpiresAt:new Date(Date.now()+store.settings.reservationHours*3600000).toISOString()};
-      await mutate(()=>{if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler foi reservado por outra candidatura. Escolha outro.');if(store.applications.some(a=>cleanTag(a.playerTag)===tag&&activeStatuses.has(a.status))||store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Já existe uma candidatura ativa ou vínculo cadastrado para esta tag.');store.applications.unshift(application);audit(null,'Candidatura recebida',`${displayName} • ${tag} • ${brawler.name}`);});return sendJSON(res,201,{ok:true,applicationId:application.id,status:application.status,apiLookupStatus,message:'Candidatura recebida. A administração fará a análise.'});
+      await mutate(()=>{if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler foi reservado por outra candidatura. Escolha outro.');if(store.applications.some(a=>cleanTag(a.playerTag)===tag&&activeStatuses.has(a.status))||store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Já existe uma candidatura ativa ou vínculo cadastrado para esta tag.');store.applications.unshift(application);audit(null,'Candidatura recebida',`${displayName} • ${tag} • ${brawler.name}`);});return sendJSON(res,201,{ok:true,applicationId:application.id,status:application.status,apiLookupStatus,message:'Candidatura recebida. A administração fará a análise.'});
     }
     if(req.method==='POST'&&url.pathname==='/api/login'){
       rateLimit(req,'login',12,15*60*1000);const body=await bodyJSON(req,5000);const email=safeText(body.email,180).toLowerCase();const password=String(body.password||'');const user=store.users.find(u=>u.email===email&&!u.disabled);if(!user||!user.passwordHash)throw httpError(401,'E-mail ou senha incorretos.');const hash=await scrypt(password,user.salt,64);if(!crypto.timingSafeEqual(hash,Buffer.from(user.passwordHash,'hex')))throw httpError(401,'E-mail ou senha incorretos.');if(!SESSION_SECRET)throw httpError(503,'O login ainda não foi ativado. Configure STAR_PARK_SESSION_SECRET no servidor.');const sessionId=crypto.randomBytes(32).toString('hex');const csrf=crypto.randomBytes(24).toString('hex');sessions.set(sessionId,{userId:user.id,csrf,expiresAt:Date.now()+12*60*60*1000});setCookie(res,'sp_session',`${sessionId}.${sessionSignature(sessionId)}`,{httpOnly:true});setCookie(res,'sp_csrf',csrf,{httpOnly:false});return sendJSON(res,200,{ok:true,user:publicUser(user)});
