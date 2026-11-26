@@ -735,7 +735,7 @@ jobs:
           assert.match(next,/ENTRAR NA COMUNIDADE DO WHATSAPP/);
           assert.match(next,/Linha do tempo/);
           assert.match(next,/Conquistas e medalhas/);
-          assert.match(next,/Central de monitoramento/);
+          assert.match(html,/Central de monitoramento/);
           assert.match(next,/data-sp-close-goal/);
           assert.match(next,/type=\"button\" class=\"mini-action danger\" data-sp-close-goal/);
           console.log('Testes adicionais de integracao aprovados.');
