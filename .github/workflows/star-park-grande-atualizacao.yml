@@ -1,0 +1,822 @@
+name: STAR PARK - Grande Atualizacao Segura
+
+on:
+  workflow_dispatch:
+    inputs:
+      criar_pull_request:
+        description: "Tentar abrir uma Pull Request para revisar a atualizacao"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: star-park-grande-atualizacao
+  cancel-in-progress: false
+
+jobs:
+  preparar-validar-e-propor:
+    name: Preparar, testar e propor a atualizacao
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Baixar o codigo atual
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Conferir estrutura e criar backup do codigo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f package.json
+          test -f server.mjs
+          test -f public/index.html
+          test -f public/app.js
+          test -f public/styles.css
+          test -f lib/firestore-store.mjs
+          node -e "const p=require('./package.json'); if(Number(String(p.engines?.node||'').match(/\\d+/)?.[0]||0)>22) process.exit(1); if(!p.scripts?.test) process.exit(2); console.log('Projeto:',p.name,'versao:',p.version)"
+          if git ls-files | grep -E '(^|/)(\.env|serviceAccountKey\.json|firebase-service-account[^/]*\.json|.*\.pem)$' >/tmp/starpark-sensitive-files.txt; then
+            echo 'ERRO: existem arquivos potencialmente sensiveis versionados. Backup cancelado.'
+            cat /tmp/starpark-sensitive-files.txt
+            exit 1
+          fi
+          mkdir -p /tmp/starpark-source-backup
+          tar -czf /tmp/starpark-source-backup/star-park-source-before-update.tar.gz \
+            package.json README.md server.mjs public/index.html public/app.js public/styles.css \
+            lib tests scripts firestore.rules
+          sha256sum /tmp/starpark-source-backup/star-park-source-before-update.tar.gz
+
+      - name: Guardar backup do codigo-fonte
+        uses: actions/upload-artifact@v7
+        with:
+          name: star-park-codigo-antes-da-atualizacao-${{ github.run_number }}
+          path: /tmp/starpark-source-backup/star-park-source-before-update.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Aplicar atualizacao com verificacao de marcadores
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > /tmp/apply-starpark-update.py <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import sys
+
+          ROOT = Path.cwd()
+          WA_URL = 'https://chat.whatsapp.com/L5n55x9ad4e3IFxSx5wE7Z'
+
+          def read(rel):
+              p = ROOT / rel
+              if not p.is_file():
+                  raise SystemExit(f'Arquivo obrigatorio ausente: {rel}')
+              return p.read_text(encoding='utf-8')
+
+          def write(rel, content):
+              (ROOT / rel).write_text(content, encoding='utf-8', newline='\n')
+
+          def replace_once(content, old, new, label):
+              count = content.count(old)
+              if count == 0:
+                  if new in content:
+                      return content
+                  raise SystemExit(f'Ponto de integracao nao encontrado: {label}. Nenhuma alteracao foi confirmada.')
+              if count != 1:
+                  raise SystemExit(f'Ponto de integracao ambiguo ({count} ocorrencias): {label}. Interrompendo por seguranca.')
+              return content.replace(old, new, 1)
+
+          def ensure_version(source):
+              match = re.search(r"const APP_VERSION = '([^']+)';", source)
+              if not match:
+                  raise SystemExit('Nao foi possivel identificar APP_VERSION.')
+              if match.group(1) not in ('5.0.3', '5.1.0'):
+                  raise SystemExit(f'Versao inesperada ({match.group(1)}). A atualizacao foi interrompida para evitar incompatibilidade.')
+              return source.replace(match.group(0), "const APP_VERSION = '5.1.0';", 1)
+
+          server = read('server.mjs')
+          index = read('public/index.html')
+          app = read('public/app.js')
+          css = read('public/styles.css')
+          store_lib = read('lib/firestore-store.mjs')
+          package_text = read('package.json')
+          readme = read('README.md')
+
+          package_data = json.loads(package_text)
+          if package_data.get('version') not in ('5.0.3', '5.1.0'):
+              raise SystemExit('Versao do package.json inesperada. Interrompendo para revisao.')
+          package_data['version'] = '5.1.0'
+          package_text = json.dumps(package_data, ensure_ascii=False, indent=2) + '\n'
+          readme = replace_once(readme, '# STAR PARK 5.0.2', '# STAR PARK 5.1.0', 'titulo da documentacao')
+
+          server = ensure_version(server)
+          server = replace_once(
+              server,
+              "const SESSION_SECRET = process.env.STAR_PARK_SESSION_SECRET || '';",
+              "const SESSION_SECRET = process.env.STAR_PARK_SESSION_SECRET || '';\nconst WHATSAPP_COMMUNITY_URL = process.env.STAR_PARK_WHATSAPP_COMMUNITY_URL || '" + WA_URL + "';",
+              'configuracao da comunidade WhatsApp'
+          )
+          server = replace_once(
+              server,
+              "function publicUser(user){return {id:user.id,name:user.name,email:user.email,role:user.role,permissions:user.permissions||rolePermissions[user.role]||[],createdAt:user.createdAt};}",
+              "function publicUser(user){return {id:user.id,name:user.name,username:user.username||null,email:user.email||null,role:user.role,permissions:user.permissions||rolePermissions[user.role]||[],createdAt:user.createdAt};}",
+              'serializacao segura do usuario'
+          )
+          server = replace_once(
+              server,
+              "if(req.method==='GET'&&url.pathname==='/api/public/settings')return sendJSON(res,200,{recruitmentOpen:store.settings.recruitmentOpen,recruitmentClosedMessage:store.settings.recruitmentClosedMessage});",
+              "if(req.method==='GET'&&url.pathname==='/api/public/settings')return sendJSON(res,200,{recruitmentOpen:store.settings.recruitmentOpen,recruitmentClosedMessage:store.settings.recruitmentClosedMessage,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL});",
+              'configuracao publica do recrutamento'
+          )
+
+          old_application = "status:'PENDING',apiLookupStatus,trophiesAtApplication,applicationTrophiesCapturedAt,submittedAt:nowISO(),createdAt:nowISO(),updatedAt:nowISO(),privateNotes:[],history:[{status:'PENDING',at:nowISO(),by:'Sistema'}],reservationExpiresAt:new Date(Date.now()+store.settings.reservationHours*3600000).toISOString()"
+          new_application = "status:'AWAITING_WHATSAPP',apiLookupStatus,trophiesAtApplication,applicationTrophiesCapturedAt,submittedAt:nowISO(),createdAt:nowISO(),updatedAt:nowISO(),privateNotes:[],history:[{status:'AWAITING_WHATSAPP',at:nowISO(),by:'Sistema',reason:'Avanco automatico para confirmacao manual de entrada na comunidade WhatsApp.'}],reservationExpiresAt:null,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL"
+          server = replace_once(server, old_application, new_application, 'estado inicial da candidatura')
+          server = replace_once(
+              server,
+              "return sendJSON(res,201,{ok:true,applicationId:application.id,status:application.status,apiLookupStatus,message:'Candidatura recebida. A administração fará a análise.'});",
+              "return sendJSON(res,201,{ok:true,applicationId:application.id,status:application.status,apiLookupStatus,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL,message:'Candidatura recebida e encaminhada para confirmacao de entrada no WhatsApp. Entre pelo link e aguarde a verificacao manual da administracao.'});",
+              'resposta de envio da candidatura'
+          )
+
+          # Login novo por nome de usuario, mantendo compatibilidade com e-mails antigos.
+          server = replace_once(
+              server,
+              "rateLimit(req,'login',12,15*60*1000);const body=await bodyJSON(req,5000);const email=safeText(body.email,180).toLowerCase();const password=String(body.password||'');const user=store.users.find(u=>u.email===email&&!u.disabled);",
+              "rateLimit(req,'login',12,15*60*1000);const body=await bodyJSON(req,5000);const identifier=safeText(body.identifier||body.username||body.email,180).toLowerCase();const password=String(body.password||'');const user=store.users.find(u=>(String(u.username||'').toLowerCase()===identifier||String(u.email||'').toLowerCase()===identifier)&&!u.disabled);",
+              'login compativel com usuario e e-mail antigo'
+          )
+
+          # Solicitacao opcional de conta: aceita usuario e senha de 6 caracteres;
+          # e-mail passa a ser opcional, mas os pedidos legados continuam validos.
+          old_req = "const email=safeText(body.email,180).toLowerCase();\n      const tag=cleanTag(body.playerTag);\n      const password=String(body.password||'');\n      if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))throw httpError(400,'Informe um e-mail válido.');\n      if(!tagIsValid(tag))throw httpError(400,'Tag de jogador inválida. Confira a tag no Brawl Stars.');\n      if(password.length<12||password.length>128)throw httpError(400,'A senha precisa ter entre 12 e 128 caracteres.');"
+          new_req = "const username=safeText(body.username,24).toLowerCase();\n      const email=safeText(body.email,180).toLowerCase();\n      const tag=cleanTag(body.playerTag);\n      const password=String(body.password||'');\n      if(!username&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))throw httpError(400,'Informe um nome de usuario ou um e-mail valido.');\n      if(username&&!/^[a-z0-9._-]{3,24}$/.test(username))throw httpError(400,'O nome de usuario deve ter de 3 a 24 caracteres: letras, numeros, ponto, hifen ou sublinhado.');\n      if(email&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))throw httpError(400,'E-mail invalido.');\n      if(!tagIsValid(tag))throw httpError(400,'Tag de jogador inválida. Confira a tag no Brawl Stars.');\n      if(password.length<6||password.length>128)throw httpError(400,'A senha precisa ter entre 6 e 128 caracteres.');"
+          server = replace_once(server, old_req, new_req, 'validacao de solicitacao opcional de conta')
+          server = replace_once(
+              server,
+              "if(store.users.some(u=>u.email===email))throw httpError(409,'Este e-mail já possui uma conta. Tente entrar ou fale com a administração.');",
+              "if(store.users.some(u=>(email&&u.email===email)||(username&&u.username===username)))throw httpError(409,'Este nome de usuario ou e-mail ja possui uma conta. Tente entrar ou fale com a administracao.');",
+              'unicidade de usuario na solicitacao de conta'
+          )
+          server = replace_once(
+              server,
+              "if(store.accountRequests.some(r=>r.status==='PENDING'&&(r.email===email||r.memberId===member.id)))throw httpError(409,'Já existe uma solicitação de acesso aguardando análise para este e-mail ou membro.');",
+              "if(store.accountRequests.some(r=>r.status==='PENDING'&&((email&&r.email===email)||(username&&r.username===username)||r.memberId===member.id)))throw httpError(409,'Ja existe uma solicitacao de acesso aguardando analise para este usuario ou membro.');",
+              'unicidade de solicitacao de conta'
+          )
+          server = replace_once(
+              server,
+              "const requestRecord={id:id(),memberId:member.id,displayName:member.displayName,playerTag:tag,email,salt,passwordHash,status:'PENDING',createdAt:nowISO(),reviewedAt:null,reviewedBy:null};",
+              "const requestRecord={id:id(),memberId:member.id,displayName:member.displayName,playerTag:tag,username:username||null,email:email||null,salt,passwordHash,status:'PENDING',createdAt:nowISO(),reviewedAt:null,reviewedBy:null};",
+              'armazenamento seguro do usuario solicitado'
+          )
+          server = replace_once(
+              server,
+              "if(store.users.some(u=>u.email===email)||store.users.some(u=>u.role==='MEMBER'&&u.memberId===currentMember.id)||store.accountRequests.some(r=>r.status==='PENDING'&&(r.email===email||r.memberId===currentMember.id)))throw httpError(409,'Já existe uma conta ou solicitação para este e-mail ou membro.');",
+              "if(store.users.some(u=>(email&&u.email===email)||(username&&u.username===username))||store.users.some(u=>u.role==='MEMBER'&&u.memberId===currentMember.id)||store.accountRequests.some(r=>r.status==='PENDING'&&((email&&r.email===email)||(username&&r.username===username)||r.memberId===currentMember.id)))throw httpError(409,'Ja existe uma conta ou solicitacao para este usuario ou membro.');",
+              'verificacao transacional de conta duplicada'
+          )
+          server = replace_once(
+              server,
+              "if(store.users.some(u=>u.email===current.email))throw httpError(409,'Este e-mail já foi utilizado por outra conta.');",
+              "if((current.email&&store.users.some(u=>u.email===current.email))||(current.username&&store.users.some(u=>u.username===current.username)))throw httpError(409,'Este usuario ou e-mail ja foi utilizado por outra conta.');",
+              'unicidade durante aprovacao de conta'
+          )
+          server = replace_once(
+              server,
+              "created={id:id(),name:member.displayName,email:current.email,role:'MEMBER',memberId:member.id,permissions:defaultPermissions('MEMBER'),salt:current.salt,passwordHash:current.passwordHash,createdAt:nowISO(),disabled:false};",
+              "created={id:id(),name:member.displayName,username:current.username||null,email:current.email||null,role:'MEMBER',memberId:member.id,permissions:defaultPermissions('MEMBER'),salt:current.salt,passwordHash:current.passwordHash,createdAt:nowISO(),disabled:false};",
+              'criacao de conta aprovada com usuario'
+          )
+          server = replace_once(
+              server,
+              "if(req.method==='POST'&&url.pathname==='/api/admin/users'){checkCsrf(req);if(user?.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas e convites.');const body=await bodyJSON(req);const name=safeText(body.name,60),email=safeText(body.email,180).toLowerCase(),password=String(body.password||''),role=safeText(body.role,20);if(!name||!email.includes('@')||password.length<12||!roles.has(role)||role==='OWNER')throw httpError(400,'Dados inválidos. Senha mínima de 12 caracteres; OWNER não pode ser criado por este formulário.');if(store.users.some(u=>u.email===email))throw httpError(409,'Já existe uma conta com este e-mail.');const salt=crypto.randomBytes(16).toString('hex');const passwordHash=(await scrypt(password,salt,64)).toString('hex');if(role!=='MEMBER'&&user.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas administrativas.');const memberId=safeText(body.memberId,80)||null;if(role==='MEMBER'&&(!memberId||!store.members.some(m=>m.id===memberId&&m.status==='ACTIVE')))throw httpError(400,'Associe a conta a um membro ativo.');const created={id:id(),name,email,role,memberId,permissions:defaultPermissions(role),salt,passwordHash,createdAt:nowISO(),disabled:false};await mutate(()=>{if(store.users.some(u=>u.email===email))throw httpError(409,'Já existe uma conta com este e-mail.');store.users.push(created);audit(user,'Conta criada',`${email} • ${role}`);});return sendJSON(res,201,{ok:true,user:publicUser(created)});}",
+              "if(req.method==='POST'&&url.pathname==='/api/admin/users'){checkCsrf(req);if(user?.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas e convites.');const body=await bodyJSON(req);const name=safeText(body.name,60),username=safeText(body.username,24).toLowerCase(),email=safeText(body.email,180).toLowerCase(),password=String(body.password||''),role=safeText(body.role,20);if(!name||(!username&&!email.includes('@'))||(username&&!/^[a-z0-9._-]{3,24}$/.test(username))||(email&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))||password.length<6||password.length>128||!['MEMBER','ADMIN'].includes(role)||role==='OWNER')throw httpError(400,'Dados invalidos. Usuario de 3 a 24 caracteres e senha minima de 6; OWNER nao pode ser criado por este formulario.');if(store.users.some(u=>(username&&u.username===username)||(email&&u.email===email)))throw httpError(409,'Ja existe uma conta com este usuario ou e-mail.');const salt=crypto.randomBytes(16).toString('hex');const passwordHash=(await scrypt(password,salt,64)).toString('hex');if(role!=='MEMBER'&&user.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas administrativas.');const memberId=safeText(body.memberId,80)||null;if(role==='MEMBER'&&(!memberId||!store.members.some(m=>m.id===memberId&&m.status==='ACTIVE')))throw httpError(400,'Associe a conta a um membro ativo.');const created={id:id(),name,username:username||null,email:email||null,role,memberId,permissions:defaultPermissions(role),salt,passwordHash,createdAt:nowISO(),disabled:false};await mutate(()=>{if(store.users.some(u=>(username&&u.username===username)||(email&&u.email===email)))throw httpError(409,'Ja existe uma conta com este usuario ou e-mail.');store.users.push(created);audit(user,'Conta criada',`${username||email} • ${role}`);});return sendJSON(res,201,{ok:true,user:publicUser(created)});}",
+              'criacao administrativa de contas compativel com usuario'
+          )
+
+          # A confirmacao manual e idempotente: nunca cria um segundo membro para a mesma candidatura/tag.
+          server = replace_once(
+              server,
+              "if(app.status!=='AWAITING_WHATSAPP')throw httpError(409,'A candidatura precisa estar aguardando confirmação do WhatsApp.');\n        const brawler=rosterEntry(app.desiredBrawlerId??app.desiredBrawlerKey);",
+              "if(app.status!=='AWAITING_WHATSAPP')throw httpError(409,'A candidatura precisa estar aguardando confirmação do WhatsApp.');\n        if(store.members.some(m=>m.applicationId===app.id||((cleanTag(m.playerTag)===cleanTag(app.playerTag))&&m.status==='ACTIVE')))throw httpError(409,'Ja existe um membro ativo vinculado a esta candidatura ou tag. Nenhum cadastro duplicado foi criado.');\n        const brawler=rosterEntry(app.desiredBrawlerId??app.desiredBrawlerKey);",
+              'protecao contra duplicidade antes da ativacao'
+          )
+          server = replace_once(
+              server,
+              "if(app.status!=='AWAITING_WHATSAPP'||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura ou a reserva mudou durante a ativação. Recarregue a lista.');\n          app.status='ACTIVE';",
+              "if(app.status!=='AWAITING_WHATSAPP'||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura ou a reserva mudou durante a ativação. Recarregue a lista.');\n          if(store.members.some(m=>m.applicationId===app.id||((cleanTag(m.playerTag)===cleanTag(app.playerTag))&&m.status==='ACTIVE')))throw httpError(409,'A tag ja foi ativada em outra operacao. Recarregue a lista antes de tentar novamente.');\n          app.status='ACTIVE';",
+              'protecao transacional contra membro duplicado'
+          )
+
+          # Personalizacao de perfil: apenas texto simples, limitado e controlado no servidor.
+          server = replace_once(
+              server,
+              "function publicMember(m){const settings=m.publicProfileSettings||{};return {id:m.id,displayName:m.displayName,gameNickname:store.settings.showNickname&&settings.showNickname!==false?m.gameNickname:null,playerTag:store.settings.showTag&&settings.showTag?m.playerTag:null,representedBrawlerName:m.representedBrawlerName,currentTrophies:m.currentTrophies,baselineTrophies:store.settings.showEvolution&&settings.showEvolution!==false?m.baselineTrophies:null,baselineStatus:m.baselineStatus,joinedAt:m.joinedAt,lastSyncedAt:m.currentTrophiesCapturedAt,apiSyncStatus:m.apiSyncStatus||'PENDING',avatar:m.avatar||null};}",
+              "function publicMember(m){const settings=m.publicProfileSettings||{};return {id:m.id,displayName:m.displayName,gameNickname:store.settings.showNickname&&settings.showNickname!==false?m.gameNickname:null,playerTag:store.settings.showTag&&settings.showTag?m.playerTag:null,representedBrawlerName:m.representedBrawlerName,currentTrophies:m.currentTrophies,baselineTrophies:store.settings.showEvolution&&settings.showEvolution!==false?m.baselineTrophies:null,baselineStatus:m.baselineStatus,joinedAt:m.joinedAt,lastSyncedAt:m.currentTrophiesCapturedAt,apiSyncStatus:m.apiSyncStatus||'PENDING',avatar:m.avatar||null,profileTheme:settings.public!==false?(m.profileTheme||'blue'):null,profileTitle:settings.public!==false?(m.profileTitle||null):null,bio:settings.public!==false?(m.bio||null):null};}",
+              'campos publicos do perfil personalizavel'
+          )
+          server = replace_once(
+              server,
+              "await mutate(()=>{member.displayName=displayName;member.gameNickname=gameNickname;member.publicProfileSettings={...(member.publicProfileSettings||{}),public:body.public===true,showNickname:body.showNickname===true,showTag:body.showTag===true,showEvolution:body.showEvolution===true};audit(user,'Perfil pessoal atualizado',member.displayName);});",
+              "await mutate(()=>{member.displayName=displayName;member.gameNickname=gameNickname;member.profileTitle=safeText(body.profileTitle,40);member.bio=safeText(body.bio,180);if(['⭐','🏆','🎮','⚡','🌟','🚀'].includes(body.avatar))member.avatar=body.avatar;if(['blue','purple','gold','green'].includes(body.profileTheme))member.profileTheme=body.profileTheme;member.publicProfileSettings={...(member.publicProfileSettings||{}),public:body.public===true,showNickname:body.showNickname===true,showTag:body.showTag===true,showEvolution:body.showEvolution===true};audit(user,'Perfil pessoal atualizado',member.displayName);});",
+              'persistencia dos campos de perfil'
+          )
+
+          # Inscricao em evento: permite cancelar a propria presenca.
+          server = replace_once(
+              server,
+              "if(req.method==='POST'&&url.pathname==='/api/member/event-registration'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const event=store.events.find(e=>e.id===body.eventId&&e.status==='PUBLISHED');if(!event)throw httpError(404,'Evento não encontrado.');await mutate(()=>{event.registrations=event.registrations||[];if(event.registrations.includes(user.memberId))return;if(event.limit&&event.registrations.length>=event.limit)throw httpError(409,'As vagas deste evento foram preenchidas.');event.registrations.push(user.memberId);audit(user,'Inscrição em evento',event.title);});return sendJSON(res,200,{ok:true});}",
+              "if(req.method==='POST'&&url.pathname==='/api/member/event-registration'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const event=store.events.find(e=>e.id===body.eventId&&e.status==='PUBLISHED');if(!event)throw httpError(404,'Evento não encontrado.');await mutate(()=>{event.registrations=event.registrations||[];if(event.registrations.includes(user.memberId))return;if(event.limit&&event.registrations.length>=event.limit)throw httpError(409,'As vagas deste evento foram preenchidas.');event.registrations.push(user.memberId);audit(user,'Inscrição em evento',event.title);});return sendJSON(res,200,{ok:true});}\n    if(req.method==='POST'&&url.pathname==='/api/member/event-registration/cancel'){checkCsrf(req);requirePermission(user,'member.self');const body=await bodyJSON(req);const event=store.events.find(e=>e.id===body.eventId&&e.status==='PUBLISHED');if(!event)throw httpError(404,'Evento nao encontrado.');await mutate(()=>{event.registrations=Array.isArray(event.registrations)?event.registrations:[];event.registrations=event.registrations.filter(id=>id!==user.memberId);audit(user,'Cancelamento de inscricao em evento',event.title);});return sendJSON(res,200,{ok:true});}",
+              'cancelamento de inscricao em evento'
+          )
+
+          # Metas coletivas ficam no documento de configuracoes existente (nenhuma colecao nova).
+          server = replace_once(
+              server,
+              "if(req.method==='GET'&&url.pathname==='/api/public/summary')return sendJSON(res,200,publicSummary());",
+              "if(req.method==='GET'&&url.pathname==='/api/public/summary')return sendJSON(res,200,publicSummary());\n    if(req.method==='GET'&&url.pathname==='/api/public/goals'){const active=store.members.filter(m=>m.status==='ACTIVE');const items=(Array.isArray(store.settings.collectiveGoals)?store.settings.collectiveGoals:[]).map(g=>{const current=g.metric==='members'?active.length:(active.length&&active.every(m=>validNumber(m.currentTrophies))?active.reduce((sum,m)=>sum+Number(m.currentTrophies),0):null);return {...g,current,progress:current===null?null:Math.min(100,Math.round(current/Math.max(1,Number(g.target))*100))};});return sendJSON(res,200,{items});}",
+              'consulta publica de metas coletivas'
+          )
+          server = replace_once(
+              server,
+              "if(req.method==='POST'&&url.pathname==='/api/admin/settings'){checkCsrf(req);requirePermission(user,'settings.write');",
+              "if(req.method==='POST'&&url.pathname==='/api/admin/goals'){checkCsrf(req);requirePermission(user,'settings.write');const body=await bodyJSON(req);const action=safeText(body.action,20);if(action==='create'){const title=safeText(body.title,80),description=safeText(body.description,240),metric=safeText(body.metric,20),target=Number(body.target);if(!title||!['members','trophies'].includes(metric)||!Number.isInteger(target)||target<1||target>100000000)throw httpError(400,'Informe titulo, metrica e meta valida.');const goal={id:id(),title,description,metric,target,status:'ACTIVE',createdAt:nowISO(),createdBy:user.id};await mutate(()=>{store.settings.collectiveGoals=Array.isArray(store.settings.collectiveGoals)?store.settings.collectiveGoals:[];store.settings.collectiveGoals.unshift(goal);audit(user,'Meta coletiva criada',title);});return sendJSON(res,201,{ok:true,goal});}if(action==='close'){const goal=(store.settings.collectiveGoals||[]).find(g=>g.id===body.id);if(!goal)throw httpError(404,'Meta coletiva nao encontrada.');await mutate(()=>{goal.status='CLOSED';goal.closedAt=nowISO();audit(user,'Meta coletiva encerrada',goal.title);});return sendJSON(res,200,{ok:true});}throw httpError(400,'Acao de meta invalida.');}\n      if(req.method==='POST'&&url.pathname==='/api/admin/settings'){checkCsrf(req);requirePermission(user,'settings.write');",
+              'gestao administrativa de metas coletivas'
+          )
+
+          # Perfil do jogador: inclui inscricao atual, conquistas e linha do tempo calculadas com dados existentes.
+          old_member_get = "if(req.method==='GET'&&url.pathname==='/api/member/me'){requirePermission(user,'member.self');const member=store.members.find(m=>m.id===user.memberId&&m.status==='ACTIVE');if(!member)throw httpError(404,'Perfil de membro não encontrado.');const battles=member.battleHistory||[];return sendJSON(res,200,{member:"
+          new_member_get = "if(req.method==='GET'&&url.pathname==='/api/member/me'){requirePermission(user,'member.self');const member=store.members.find(m=>m.id===user.memberId&&m.status==='ACTIVE');if(!member)throw httpError(404,'Perfil de membro não encontrado.');const battles=member.battleHistory||[];const trophies=validNumber(member.currentTrophies)?Number(member.currentTrophies):null;const observed=Number(member.battleUsage?.totalObserved)||battles.length;const achievements=[{id:'profile-sync',title:'Primeira sincronizacao',description:'Perfil consultado pela API oficial.',earned:Boolean(member.currentTrophiesCapturedAt)},{id:'five-thousand',title:'5 mil trofeus',description:'Alcance 5.000 trofeus atuais.',earned:trophies!==null&&trophies>=5000},{id:'twenty-five-thousand',title:'25 mil trofeus',description:'Alcance 25.000 trofeus atuais.',earned:trophies!==null&&trophies>=25000},{id:'ten-battles',title:'Dez batalhas observadas',description:'Dez partidas registradas pelo Star Park.',earned:observed>=10}];const timeline=[...(member.joinedAt?[{id:'joined',type:'joined',title:'Entrada na Star Park',at:member.joinedAt}]:[]),...(member.trophyHistory||[]).slice(-8).map((x,i)=>({id:'trophy-'+i,type:'trophy',title:'Registro de trofeus: '+x.trophies,at:x.capturedAt})),...battles.slice(-8).map((x,i)=>({id:'battle-'+i,type:'battle',title:(x.brawlerName||'Batalha')+' · '+(x.result||'resultado indisponivel'),at:x.battleTime||x.observedAt}))].filter(x=>x.at).sort((a,b)=>String(b.at).localeCompare(String(a.at))).slice(0,15);const notifications=[...(store.announcements||[]).filter(a=>a.status==='PUBLISHED'&&a.visibility!=='PUBLIC').slice(0,5).map(a=>({id:'announcement-'+a.id,type:'announcement',title:a.title,at:a.createdAt})),...(store.events||[]).filter(e=>e.status==='PUBLISHED'&&String(e.date)>=nowISO().slice(0,10)).slice(0,5).map(e=>({id:'event-'+e.id,type:'event',title:'Evento: '+e.title,at:e.date})),...(member.apiSyncStatus&&member.apiSyncStatus!=='OK'?[{id:'api-status',type:'system',title:'Sincronizacao do perfil: '+member.apiSyncStatus,at:member.lastSyncAttemptAt||nowISO()}]:[])].sort((a,b)=>String(b.at).localeCompare(String(a.at))).slice(0,10);return sendJSON(res,200,{member:"
+          server = replace_once(server, old_member_get, new_member_get, 'dados de conquistas e linha do tempo')
+          server = replace_once(
+              server,
+              "events:store.events.filter(e=>e.status==='PUBLISHED').map(({registrations,...e})=>({...e,registrationsCount:registrations?.length||0})),announcements:store.announcements.filter(a=>a.status==='PUBLISHED'&&a.visibility!=='PUBLIC')});}",
+              "events:store.events.filter(e=>e.status==='PUBLISHED').map(({registrations,...e})=>({...e,registrationsCount:registrations?.length||0,isRegistered:Array.isArray(store.events.find(x=>x.id===e.id)?.registrations)&&store.events.find(x=>x.id===e.id).registrations.includes(user.memberId)})),announcements:store.announcements.filter(a=>a.status==='PUBLISHED'&&a.visibility!=='PUBLIC'),achievements,timeline,notifications});}",
+              'retorno das novidades da Central do Jogador'
+          )
+
+          # Monitoramento administrativo: agrega status operacional sem expor segredos.
+          server = replace_once(
+              server,
+              "return sendJSON(res,200,{pendingApplications:pending,activeMembers:members.length,reservedBrawlers:roster.filter(b=>brawlerState(b.key)==='RESERVED').length,baselinePending:members.filter(m=>m.baselineStatus==='PENDING_CAPTURE').length,apiFailures:members.filter(m=>m.apiSyncStatus!=='OK').length,upcomingEvents:store.events.filter(e=>e.status==='PUBLISHED'&&e.date>=new Date().toISOString().slice(0,10)).length,recentAudit:store.audit.slice(0,8)});",
+              "return sendJSON(res,200,{pendingApplications:pending,awaitingWhatsApp:store.applications.filter(a=>a.status==='AWAITING_WHATSAPP').length,activeMembers:members.length,reservedBrawlers:roster.filter(b=>brawlerState(b.key)==='RESERVED').length,baselinePending:members.filter(m=>m.baselineStatus==='PENDING_CAPTURE').length,apiFailures:members.filter(m=>m.apiSyncStatus!=='OK').length,upcomingEvents:store.events.filter(e=>e.status==='PUBLISHED'&&e.date>=new Date().toISOString().slice(0,10)).length,recentAudit:store.audit.slice(0,8)});",
+              'indicadores administrativos de monitoramento'
+          )
+
+          # Permite papel legado MODERATOR sem oferecer esse cargo para novos cadastros.
+          server = replace_once(
+              server,
+              "if(req.method==='POST'&&url.pathname==='/api/admin/users'){checkCsrf(req);if(user?.role!=='OWNER')",
+              "if(req.method==='POST'&&url.pathname==='/api/admin/users'){checkCsrf(req);if(user?.role!=='OWNER')",
+              'preservacao da rota de contas administrativas'
+          )
+
+          # Static allowlist: apenas os dois novos assets publicos sao expostos.
+          server = replace_once(
+              server,
+              "const allowed=new Set(['/index.html','/styles.css','/app.js','/brawlers.json','/brawlers-supplement.json','/assets/hero-crew.svg']);",
+              "const allowed=new Set(['/index.html','/styles.css','/app.js','/starpark-next.js','/starpark-next.css','/brawlers.json','/brawlers-supplement.json','/assets/hero-crew.svg']);",
+              'allowlist segura dos assets novos'
+          )
+
+          # Frontend principal: campos de perfil e controles de eventos com inscricao real.
+          app = replace_once(app, "MODERATOR:'Moderador'", "MODERATOR:'Administrador'", 'rotulo de cargo legado')
+          app = replace_once(
+              app,
+              "const body={displayName:f.elements.displayName.value,gameNickname:f.elements.gameNickname.value,public:f.elements.public.checked,showNickname:f.elements.showNickname.checked,showTag:f.elements.showTag.checked,showEvolution:f.elements.showEvolution.checked};",
+              "const body={displayName:f.elements.displayName.value,gameNickname:f.elements.gameNickname.value,profileTitle:f.elements.profileTitle?.value||'',bio:f.elements.bio?.value||'',avatar:f.elements.avatar?.value||'',profileTheme:f.elements.profileTheme?.value||'blue',public:f.elements.public.checked,showNickname:f.elements.showNickname.checked,showTag:f.elements.showTag.checked,showEvolution:f.elements.showEvolution.checked};",
+              'envio dos campos de perfil personalizavel'
+          )
+          app = replace_once(
+              app,
+              "const pf=$('#memberProfileForm');pf.elements.displayName.value=m.displayName||'';pf.elements.gameNickname.value=m.gameNickname||'';pf.elements.public.checked=m.publicProfileSettings?.public!==false;pf.elements.showNickname.checked=m.publicProfileSettings?.showNickname!==false;pf.elements.showTag.checked=m.publicProfileSettings?.showTag===true;pf.elements.showEvolution.checked=m.publicProfileSettings?.showEvolution!==false;",
+              "const pf=$('#memberProfileForm');pf.elements.displayName.value=m.displayName||'';pf.elements.gameNickname.value=m.gameNickname||'';if(pf.elements.profileTitle)pf.elements.profileTitle.value=m.profileTitle||'';if(pf.elements.bio)pf.elements.bio.value=m.bio||'';if(pf.elements.avatar&&m.avatar&&['⭐','🏆','🎮','⚡','🌟','🚀'].includes(m.avatar))pf.elements.avatar.value=m.avatar;if(pf.elements.profileTheme)pf.elements.profileTheme.value=m.profileTheme||'blue';$('#memberProfileContent').classList.remove('sp-theme-blue','sp-theme-purple','sp-theme-gold','sp-theme-green');$('#memberProfileContent').classList.add(`sp-theme-${m.profileTheme||'blue'}`);pf.elements.public.checked=m.publicProfileSettings?.public!==false;pf.elements.showNickname.checked=m.publicProfileSettings?.showNickname!==false;pf.elements.showTag.checked=m.publicProfileSettings?.showTag===true;pf.elements.showEvolution.checked=m.publicProfileSettings?.showEvolution!==false;",
+              'preenchimento dos campos do perfil personalizavel'
+          )
+          avatar_marker = "<span class=\"player-avatar\">${esc(initials(m.displayName))}</span>"
+          avatar_count = app.count(avatar_marker)
+          if avatar_count != 2:
+              raise SystemExit(f'Exibicao de avatar esperada em 2 locais, encontrada em {avatar_count}. Interrompendo por seguranca.')
+          app = app.replace(avatar_marker, "<span class=\"player-avatar\">${esc(['⭐','🏆','🎮','⚡','🌟','🚀'].includes(m.avatar)?m.avatar:initials(m.displayName))}</span>")
+          app = replace_once(
+              app,
+              "const eventsHtml=(r.events||[]).map(e=>`${eventMarkup(e)}<button class=\"mini-action primary\" data-register-event=\"${esc(e.id)}\">INSCREVER-SE</button>`).join('');",
+              "const eventsHtml=(r.events||[]).map(e=>`${eventMarkup(e)}${e.isRegistered?`<button class=\"mini-action danger\" data-cancel-event=\"${esc(e.id)}\">CANCELAR INSCRICAO</button>`:`<button class=\"mini-action primary\" data-register-event=\"${esc(e.id)}\">INSCREVER-SE</button>`}`).join('');",
+              'renderizacao do estado real das inscricoes'
+          )
+          app = replace_once(
+              app,
+              "document.addEventListener('click',async e=>{const reg=e.target.closest('[data-register-event]');if(reg){try{await api('/api/member/event-registration',{method:'POST',body:JSON.stringify({eventId:reg.dataset.registerEvent})});toast('Inscrição registrada.');await loadMemberPortal();}catch(err){toast(err.message);}}});",
+              "document.addEventListener('click',async e=>{const reg=e.target.closest('[data-register-event]');const cancel=e.target.closest('[data-cancel-event]');if(reg||cancel){try{await api(cancel?'/api/member/event-registration/cancel':'/api/member/event-registration',{method:'POST',body:JSON.stringify({eventId:cancel?cancel.dataset.cancelEvent:reg.dataset.registerEvent})});toast(cancel?'Inscricao cancelada.':'Inscricao registrada.');await loadMemberPortal();}catch(err){toast(err.message);}}});",
+              'acoes de inscricao e cancelamento'
+          )
+
+          # UI de login/primeiro acesso: username aceito, email opcional e senha de 6 caracteres.
+          index = replace_once(
+              index,
+              '<label>E-mail<input type="email" name="email" required autocomplete="username" placeholder="voce@email.com"></label>',
+              '<label>Nome de usuario ou e-mail<input type="text" name="identifier" required autocomplete="username" placeholder="Seu usuario ou e-mail antigo"></label>',
+              'login de membro por usuario'
+          )
+          index = replace_once(
+              index,
+              '<label>E-mail para login<input type="email" name="email" required maxlength="180" autocomplete="email" placeholder="voce@email.com"></label>',
+              '<label>Nome de usuario *<input type="text" name="username" required minlength="3" maxlength="24" autocomplete="username" placeholder="Escolha um usuario exclusivo"></label><label>E-mail (opcional)<input type="email" name="email" maxlength="180" autocomplete="email" placeholder="voce@email.com"></label>',
+              'formulario de conta com usuario e email opcional'
+          )
+          index = replace_once(index, 'name="password" required minlength="12" maxlength="128" autocomplete="new-password" placeholder="Mínimo de 12 caracteres"', 'name="password" required minlength="6" maxlength="128" autocomplete="new-password" placeholder="Mínimo de 6 caracteres"', 'senha minima na solicitacao de conta')
+          index = replace_once(index, 'name="confirmPassword" required minlength="12" maxlength="128" autocomplete="new-password" placeholder="Digite a senha novamente"', 'name="confirmPassword" required minlength="6" maxlength="128" autocomplete="new-password" placeholder="Digite a senha novamente"', 'confirmacao de senha minima')
+          index = replace_once(index, '<option value="MODERATOR">MODERATOR</option>', '', 'remocao de MODERATOR das novas atribuicoes')
+          index = replace_once(index, 'name="password" type="password" required minlength="12" autocomplete="new-password"', 'name="password" type="password" required minlength="6" maxlength="128" autocomplete="new-password"', 'senha minima de novas contas administrativas')
+          index = replace_once(index, '<option value="MODERATOR">MODERATOR</option>', '', 'remocao de MODERATOR das novas atribuicoes')
+          index = replace_once(index, 'name="password" type="password" required minlength="12" autocomplete="new-password"', 'name="password" type="password" required minlength="6" maxlength="128" autocomplete="new-password"', 'senha minima de novas contas administrativas')
+          index = replace_once(
+              index,
+              '<label>E-mail<input type="email" name="email" required autocomplete="username" placeholder="admin@starpark"></label>',
+              '<label>Nome de usuario ou e-mail<input type="text" name="identifier" required autocomplete="username" placeholder="Usuario administrativo ou e-mail antigo"></label>',
+              'login administrativo compativel com e-mail antigo'
+          )
+          index = replace_once(
+              index,
+              '<label>Nickname no jogo<input name="gameNickname" required maxlength="40"></label><label class="toggle-row"><span><b>Exibir meu perfil no diretório</b>',
+              '<label>Nickname no jogo<input name="gameNickname" required maxlength="40"></label><label>Titulo do perfil<input name="profileTitle" maxlength="40" placeholder="Ex.: Estrategista"></label><label>Sobre mim<textarea name="bio" rows="3" maxlength="180" placeholder="Uma breve descricao"></textarea></label><label>Avatar<select name="avatar"><option value="⭐">⭐ Estrela</option><option value="🏆">🏆 Trofeu</option><option value="🎮">🎮 Controle</option><option value="⚡">⚡ Energia</option><option value="🌟">🌟 Brilho</option><option value="🚀">🚀 Foguete</option></select></label><label>Tema do perfil<select name="profileTheme"><option value="blue">Azul</option><option value="purple">Roxo</option><option value="gold">Dourado</option><option value="green">Verde</option></select></label><label class="toggle-row"><span><b>Exibir meu perfil no diretório</b>',
+              'campos de personalizacao de perfil'
+          )
+          index = replace_once(
+              index,
+              "<script src=\"app.js\" defer></script>",
+              "<script src=\"app.js\" defer></script>\n<script src=\"starpark-next.js\" defer></script>",
+              'inclusao do modulo de novidades'
+          )
+          index = replace_once(
+              index,
+              '<link rel="stylesheet" href="styles.css">',
+              '<link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="starpark-next.css">',
+              'inclusao dos estilos novos'
+          )
+
+          # Atualiza o texto explicativo do recrutamento para refletir o novo processo.
+          index = index.replace('Envie sua candidatura para análise da administração.', 'Envie sua candidatura e entre na comunidade. A administracao confirmara sua entrada manualmente.')
+          index = index.replace('<strong>Aguarde a análise</strong><p>A equipe consulta seus dados de jogo e avalia a candidatura.</p>', '<strong>Entre no WhatsApp</strong><p>O link aparece imediatamente apos o envio da candidatura.</p>')
+          index = index.replace('<strong>Entre no WhatsApp</strong><p>Após aprovação, a administração confirma sua entrada no grupo.</p>', '<strong>Aguarde a confirmacao</strong><p>A administracao confere sua entrada e ativa seu perfil de membro.</p>')
+
+          # Painel de membros: campos aguardando WhatsApp exibidos na Central Administrativa > Membros.
+          marker = '<div class="admin-split"><form id="adminMemberForm"'
+          queue = '<div id="starparkAwaitingWhatsapp" class="game-panel sp-awaiting-panel"><div class="panel-head"><div><span class="kicker">ETAPA DE INGRESSO</span><h3>Aguardando confirmacao do WhatsApp</h3></div><span class="count-bubble" id="spAwaitingCount">0</span></div><div id="spAwaitingList" class="admin-list"></div></div>'
+          index = replace_once(index, marker, queue + marker, 'fila WhatsApp na Central Administrativa de Membros')
+
+          # Adiciona area de metas ao calendario; os objetivos e contadores vem do servidor.
+          marker_events = '<div id="publicEventList" class="event-grid">'
+          goals_public = '<div id="starparkPublicGoals" class="game-panel sp-goals-panel"><div class="panel-head"><div><span class="kicker">OBJETIVOS DA COMUNIDADE</span><h3>Metas coletivas</h3></div></div><div id="spPublicGoalsList" class="sp-goals-grid">Carregando metas...</div></div>'
+          index = replace_once(index, marker_events, goals_public + marker_events, 'area publica de metas coletivas')
+          marker_admin_events = '<div class="admin-split"><form id="adminEventForm"'
+          goals_admin = '<form id="spGoalForm" class="form-card sp-goal-form"><span class="kicker">META DA COMUNIDADE</span><h3>Criar meta coletiva</h3><label>Titulo<input name="title" required maxlength="80"></label><label>Descricao<input name="description" maxlength="240"></label><label>Metrica<select name="metric"><option value="members">Quantidade de membros ativos</option><option value="trophies">Trofeus totais da comunidade</option></select></label><label>Objetivo numerico<input name="target" type="number" min="1" max="100000000" required></label><button class="btn btn-outline" type="submit">CRIAR META</button><div id="spGoalFeedback" class="form-feedback"></div><div id="spAdminGoalsList" class="admin-list compact-list"></div></form>'
+          index = replace_once(index, marker_admin_events, goals_admin + marker_admin_events, 'gestao de metas no painel administrativo')
+
+          # Painel de monitoramento no modulo API.
+          marker_monitor = '<div id="apiAdminStatus" class="api-status-grid"></div>'
+          monitor = '<div id="starparkSystemMonitor" class="game-panel sp-monitor-panel"><div class="panel-head"><div><span class="kicker">SAUDE DA PLATAFORMA</span><h3>Central de monitoramento</h3></div><span id="spSystemHealth" class="status-tag">Verificando...</span></div><div id="spMonitorDetails" class="sp-monitor-grid"></div></div>'
+          index = replace_once(index, marker_monitor, monitor + marker_monitor, 'central de monitoramento administrativo')
+
+          # Persiste as alteracoes apenas depois de todos os pontos de integracao terem sido encontrados.
+          write('package.json', package_text)
+          write('README.md', readme)
+          write('server.mjs', server)
+          write('public/app.js', app)
+          write('public/index.html', index)
+          write('lib/firestore-store.mjs', store_lib)
+
+          (ROOT / 'public/starpark-next.js').write_text(r'''/* STAR PARK NEXT - melhorias incrementais, sem chat interno */
+          (() => {
+            'use strict';
+            const WA_URL = 'https://chat.whatsapp.com/L5n55x9ad4e3IFxSx5wE7Z';
+            const $ = (selector, root = document) => root.querySelector(selector);
+            const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+            const fmt = value => value == null ? '—' : new Intl.NumberFormat('pt-BR').format(value);
+            const date = value => value ? new Date(value).toLocaleString('pt-BR', {dateStyle:'short', timeStyle:'short'}) : 'Data indisponivel';
+            let previewTimer = null;
+            let previewController = null;
+            let adminQueueBusy = false;
+
+            function safeApi(path, options) {
+              if (typeof api === 'function') return api(path, options || {});
+              return fetch(path, {credentials:'same-origin', cache:'no-store', ...(options || {})}).then(async response => {
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(payload.error || `Erro HTTP ${response.status}`);
+                return payload;
+              });
+            }
+
+            function setupTagPreview() {
+              const form = $('#applicationForm');
+              const field = form?.elements?.playerTag;
+              if (!form || !field || $('#spTagPreview')) return;
+              const panel = document.createElement('section');
+              panel.id = 'spTagPreview';
+              panel.className = 'sp-tag-preview';
+              panel.setAttribute('aria-live', 'polite');
+              panel.innerHTML = '<b>Previa do perfil Brawl Stars</b><p>Digite sua tag para conferir a conta encontrada.</p>';
+              field.closest('label')?.insertAdjacentElement('afterend', panel);
+              const show = (title, message, kind = '') => {
+                panel.className = `sp-tag-preview ${kind}`;
+                panel.replaceChildren();
+                const heading = document.createElement('b'); heading.textContent = title;
+                const body = document.createElement('p'); body.textContent = message;
+                panel.append(heading, body);
+              };
+              field.addEventListener('input', () => {
+                clearTimeout(previewTimer);
+                if (previewController) previewController.abort();
+                const tag = String(field.value || '').replace(/^#/, '').replace(/\s+/g, '').toUpperCase();
+                if (!tag) { show('Previa do perfil Brawl Stars', 'Digite sua tag para conferir a conta encontrada.'); return; }
+                if (!/^[0289PYLQGRJCUV]{3,15}$/.test(tag)) { show('Tag incompleta ou invalida', 'Confira os caracteres da tag antes de continuar.', 'error'); return; }
+                show('Consultando a API oficial...', 'Buscando nome, tag, trofeus e clube.');
+                previewTimer = setTimeout(async () => {
+                  previewController = new AbortController();
+                  try {
+                    const result = await safeApi(`/api/player/${encodeURIComponent(tag)}`, {signal: previewController.signal});
+                    const player = result.player || {};
+                    if (!player.name) { show('Perfil nao encontrado', 'Confira a tag e tente novamente.', 'error'); return; }
+                    panel.className = 'sp-tag-preview success';
+                    panel.replaceChildren();
+                    const title = document.createElement('b'); title.textContent = 'Confira se este e seu perfil';
+                    const name = document.createElement('strong'); name.textContent = player.name;
+                    const detail = document.createElement('p'); detail.textContent = `#${tag} · ${fmt(player.trophies)} trofeus · Clube: ${player.club?.name || 'Nao informado'}`;
+                    const note = document.createElement('small'); note.textContent = 'Dados retornados pela API. Se nao corresponderem a sua conta, corrija a tag antes de enviar.';
+                    panel.append(title, name, detail, note);
+                  } catch (error) {
+                    if (error.name === 'AbortError') return;
+                    if (/nao encontrado|não encontrado|HTTP 404/i.test(error.message || '')) { show('Perfil nao encontrado', 'Confira a tag e tente novamente.', 'error'); return; }
+                    show('Nao foi possivel consultar agora', `${error.message || 'A API esta temporariamente indisponivel.'} Voce pode conferir a tag novamente antes do envio.`, 'error');
+                  }
+                }, 650);
+              });
+            }
+
+            function setupWhatsAppSuccess() {
+              const feedback = $('#applicationFeedback');
+              if (!feedback || feedback.dataset.spObserver) return;
+              feedback.dataset.spObserver = '1';
+              const observer = new MutationObserver(() => {
+                const message = feedback.textContent || '';
+                if (!/Candidatura recebida|Protocolo/i.test(message)) return;
+                if ($('#spApplicationWhatsApp')) return;
+                const box = document.createElement('div');
+                box.id = 'spApplicationWhatsApp';
+                box.className = 'sp-application-next';
+                const title = document.createElement('b'); title.textContent = 'Proxima etapa: entrar na comunidade';
+                const copy = document.createElement('p'); copy.textContent = 'Sua candidatura ja esta aguardando a confirmacao manual da administracao. Entre pelo link e aguarde a verificacao.';
+                const link = document.createElement('a'); link.href = WA_URL; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'ENTRAR NA COMUNIDADE DO WHATSAPP';
+                box.append(title, copy, link);
+                feedback.insertAdjacentElement('afterend', box);
+              });
+              observer.observe(feedback, {childList:true, subtree:true, characterData:true});
+            }
+
+            function setupMemberQueue() {
+              const host = $('#spAwaitingList');
+              if (!host) return;
+              const render = async () => {
+                if (!auth?.user || auth.user.role === 'MEMBER' || adminQueueBusy) return;
+                adminQueueBusy = true;
+                try {
+                  const result = await safeApi('/api/admin/applications');
+                  const items = (result.items || []).filter(item => item.status === 'AWAITING_WHATSAPP');
+                  $('#spAwaitingCount').textContent = String(items.length);
+                  host.innerHTML = items.length ? items.map(item => `<article class="admin-row sp-awaiting-row" data-sp-application="${esc(item.id)}"><div class="admin-row-main"><b>${esc(item.displayName)} · ${esc(item.gameNickname)}</b><small>#${esc(item.playerTag)} · ${esc(item.desiredBrawlerName || 'Brawler nao informado')} · Enviada: ${esc(date(item.submittedAt))}</small><span class="status-tag warn">AGUARDANDO WHATSAPP</span></div><div class="admin-row-actions"><button class="mini-action primary" type="button" data-sp-confirm>CONFIRMAR ENTRADA</button><button class="mini-action danger" type="button" data-sp-reject>REJEITAR</button></div></article>`).join('') : '<div class="empty-box"><b>Nenhuma pessoa aguardando confirmacao.</b><p>Novas candidaturas aparecerao aqui depois do envio.</p></div>';
+                } catch (error) {
+                  host.textContent = error.message || 'Nao foi possivel carregar a fila.';
+                } finally { adminQueueBusy = false; }
+              };
+              host.addEventListener('click', async event => {
+                const button = event.target.closest('button');
+                const row = event.target.closest('[data-sp-application]');
+                if (!button || !row) return;
+                button.disabled = true;
+                try {
+                  if (button.hasAttribute('data-sp-confirm')) {
+                    if (!confirm('Voce verificou que a pessoa entrou na comunidade WhatsApp? A confirmacao criara o perfil de membro, sem criar uma conta de login.')) return;
+                    await safeApi(`/api/admin/applications/${row.dataset.spApplication}/confirm-whatsapp`, {method:'POST', body:'{}'});
+                  } else if (button.hasAttribute('data-sp-reject')) {
+                    const reason = prompt('Motivo interno da rejeicao (opcional):') || 'Decisao administrativa';
+                    await safeApi(`/api/admin/applications/${row.dataset.spApplication}/transition`, {method:'POST', body:JSON.stringify({status:'REJECTED', reason})});
+                  }
+                  if (typeof loadAdminData === 'function') await loadAdminData();
+                  if (typeof loadPublic === 'function') await loadPublic();
+                  await render();
+                } catch (error) { alert(error.message || 'Nao foi possivel concluir a acao.'); }
+                finally { button.disabled = false; }
+              });
+              render();
+              setTimeout(render, 2500);
+              setInterval(() => { if (document.visibilityState === 'visible') render(); }, 60000);
+            }
+
+            function setupMemberExtras() {
+              const page = $('#page-member-home');
+              const dashboard = $('#memberDashboard');
+              if (!page || !dashboard || $('#spMemberExtras')) return;
+              const section = document.createElement('section');
+              section.id = 'spMemberExtras';
+              section.className = 'sp-member-extras';
+              section.innerHTML = '<div class="sp-extra-grid"><article class="game-panel"><div class="panel-head"><div><span class="kicker">CENTRAL DE AVISOS</span><h3>Notificacoes</h3></div></div><div id="spMemberNotifications" class="admin-list compact-list">Carregando...</div></article><article class="game-panel"><div class="panel-head"><div><span class="kicker">PROGRESSO</span><h3>Conquistas e medalhas</h3></div></div><div id="spMemberAchievements" class="sp-achievement-list">Carregando...</div></article></div><article class="game-panel"><div class="panel-head"><div><span class="kicker">HISTORICO PESSOAL</span><h3>Linha do tempo</h3></div></div><div id="spMemberTimeline" class="sp-timeline">Carregando...</div></article>';
+              dashboard.insertAdjacentElement('afterend', section);
+              const refresh = async () => {
+                if (!auth?.user || auth.user.role !== 'MEMBER') return;
+                try {
+                  const result = await safeApi('/api/member/me');
+                  const notifications = result.notifications || [];
+                  $('#spMemberNotifications').innerHTML = notifications.length ? notifications.map(item => `<article class="admin-row"><div class="admin-row-main"><b>${esc(item.title)}</b><small>${esc(date(item.at))}</small></div><span class="status-tag">${esc(item.type)}</span></article>`).join('') : '<div class="empty-box">Nenhum aviso novo.</div>';
+                  const achievements = result.achievements || [];
+                  $('#spMemberAchievements').innerHTML = achievements.map(item => `<div class="sp-achievement ${item.earned ? 'earned' : ''}"><span>${item.earned ? '★' : '☆'}</span><div><b>${esc(item.title)}</b><small>${esc(item.description)}</small></div><strong>${item.earned ? 'CONQUISTADA' : 'EM PROGRESSO'}</strong></div>`).join('') || '<div class="empty-box">Suas conquistas aparecerao aqui.</div>';
+                  const timeline = result.timeline || [];
+                  $('#spMemberTimeline').innerHTML = timeline.length ? timeline.map(item => `<div class="sp-timeline-item"><i></i><div><b>${esc(item.title)}</b><small>${esc(date(item.at))}</small></div></div>`).join('') : '<div class="empty-box">Ainda nao ha atividades suficientes para montar a linha do tempo.</div>';
+                } catch (error) {
+                  $('#spMemberNotifications').textContent = error.message || 'Falha ao carregar notificacoes.';
+                }
+              };
+              refresh();
+              setTimeout(refresh, 2500);
+              setInterval(() => { if (document.visibilityState === 'visible' && document.querySelector('#page-member-home:not([hidden])')) refresh(); }, 60000);
+            }
+
+            function setupGoals() {
+              const publicHost = $('#spPublicGoalsList');
+              const adminHost = $('#spAdminGoalsList');
+              const form = $('#spGoalForm');
+              const render = async () => {
+                const result = await safeApi('/api/public/goals');
+                const items = result.items || [];
+                if (publicHost) publicHost.innerHTML = items.length ? items.filter(g => g.status === 'ACTIVE').map(g => `<article class="sp-goal-card"><div><b>${esc(g.title)}</b><p>${esc(g.description || '')}</p></div><strong>${g.current == null ? 'Dados incompletos' : `${fmt(g.current)} / ${fmt(g.target)}`}</strong><div class="sp-progress"><span style="width:${g.progress == null ? 0 : g.progress}%"></span></div><small>${g.progress == null ? 'Aguardando dados reais completos' : `${g.progress}% concluido`}</small></article>`).join('') : '<div class="empty-box">A administracao ainda nao criou metas coletivas.</div>';
+                if (adminHost) adminHost.innerHTML = items.map(g => `<article class="admin-row"><div class="admin-row-main"><b>${esc(g.title)}</b><small>${esc(g.metric)} · ${fmt(g.current)} / ${fmt(g.target)} · ${esc(g.status)}</small></div>${g.status === 'ACTIVE' ? `<button class="mini-action danger" data-sp-close-goal="${esc(g.id)}">ENCERRAR</button>` : ''}</article>`).join('');
+              };
+              if (form) form.addEventListener('submit', async event => {
+                event.preventDefault();
+                const body = Object.fromEntries(new FormData(form));
+                body.action = 'create'; body.target = Number(body.target);
+                const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+                try { await safeApi('/api/admin/goals', {method:'POST', body:JSON.stringify(body)}); form.reset(); $('#spGoalFeedback').textContent='Meta coletiva criada.'; await render(); }
+                catch (error) { $('#spGoalFeedback').textContent=error.message || 'Nao foi possivel criar a meta.'; }
+                finally { button.disabled=false; }
+              });
+              if (adminHost) adminHost.addEventListener('click', async event => {
+                const button = event.target.closest('[data-sp-close-goal]'); if (!button) return;
+                try { await safeApi('/api/admin/goals', {method:'POST', body:JSON.stringify({action:'close', id:button.dataset.spCloseGoal})}); await render(); }
+                catch (error) { alert(error.message || 'Nao foi possivel encerrar a meta.'); }
+              });
+              render().catch(error => { if (publicHost) publicHost.textContent=error.message; });
+            }
+
+            function setupMonitor() {
+              const status = $('#spSystemHealth');
+              const host = $('#spMonitorDetails');
+              if (!status || !host) return;
+              const refresh = async () => {
+                try {
+                  const h = await safeApi('/api/health');
+                  const p = h.playerSync || {};
+                  status.textContent = h.ok ? 'SERVIDOR ONLINE' : 'ATENCAO';
+                  status.className = `status-tag ${h.ok ? 'good' : 'warn'}`;
+                  const rows = [['Versao', h.appVersion],['Armazenamento',h.storageDriver],['Persistencia configurada',h.storage?.configured?'Sim':'Nao'],['Revisao Firestore',h.storage?.revision ?? 'N/A'],['API Brawl Stars',h.apiConfigured?'Configurada':'Nao configurada'],['Membros ativos',p.activeMembers ?? 0],['Perfis com sincronizacao parcial',p.partialMembers ?? 0],['Perfis desatualizados',p.staleMembers ?? 0],['Ultimo ciclo',date(p.lastSyncAt)],['Ultimo erro',p.lastError || 'Nenhum erro informado']];
+                  host.innerHTML = rows.map(([label,value]) => `<div class="sp-monitor-stat"><small>${esc(label)}</small><b>${esc(value)}</b></div>`).join('');
+                } catch (error) { status.textContent='FALHA DE CONSULTA'; status.className='status-tag warn'; host.textContent=error.message || 'Monitoramento indisponivel.'; }
+              };
+              refresh(); setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 30000);
+            }
+
+            function setupOnboarding() {
+              let seen = false;
+              try { seen = localStorage.getItem('starpark-onboarding-v1') === '1'; } catch {}
+              if (seen) return;
+              const overlay = document.createElement('div');
+              overlay.className = 'sp-onboarding-backdrop';
+              overlay.innerHTML = '<section class="sp-onboarding" role="dialog" aria-modal="true" aria-labelledby="spOnboardingTitle"><span class="kicker">BEM-VINDO A STAR PARK</span><h2 id="spOnboardingTitle">Sua jornada comeca aqui!</h2><p>Explore a comunidade, confira os rankings, acompanhe eventos e, depois de se tornar membro, use a Central do Jogador para acompanhar sua evolucao.</p><ul><li>Recrutamento e confirmacao pelo WhatsApp.</li><li>Dados de jogo consultados pela API, sem inventar estatisticas.</li><li>Comunicados oficiais dentro da plataforma; conversas continuam no WhatsApp.</li></ul><button type="button" class="btn btn-yellow" id="spOnboardingClose">ENTENDI</button></section>';
+              document.body.append(overlay);
+              $('#spOnboardingClose', overlay).addEventListener('click', () => { try { localStorage.setItem('starpark-onboarding-v1','1'); } catch {} overlay.remove(); });
+            }
+
+            function init() {
+              setupTagPreview();
+              setupWhatsAppSuccess();
+              setupMemberQueue();
+              setupMemberExtras();
+              setupGoals();
+              setupMonitor();
+              setupOnboarding();
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once:true});
+            else init();
+          })();
+          '''.replace('\n          ', '\n'), encoding='utf-8')
+
+          (ROOT / 'public/starpark-next.css').write_text(r'''/* STAR PARK NEXT - estilos responsivos incrementais */
+          .sp-theme-blue{border-color:#1686e7!important}.sp-theme-purple{border-color:#8662e8!important}.sp-theme-gold{border-color:#d6a900!important}.sp-theme-green{border-color:#35b88a!important}
+          .sp-tag-preview,.sp-application-next{margin:12px 0;padding:14px;border:2px solid #bad9ee;border-radius:14px;background:#f2faff;color:#14243e}
+          .sp-tag-preview p,.sp-application-next p{margin:6px 0;color:#516b86;line-height:1.5}
+          .sp-tag-preview strong{display:block;margin-top:8px;font-size:20px}
+          .sp-tag-preview.success{border-color:#39b987;background:#effcf6}
+          .sp-tag-preview.error{border-color:#e69a70;background:#fff7f1}
+          .sp-tag-preview small{display:block;margin-top:8px;color:#526b82}
+          .sp-application-next{border-color:#27a875;background:#effcf6}
+          .sp-application-next a{display:inline-flex;margin-top:8px;padding:11px 15px;border:2px solid #14243e;border-radius:10px;background:#25d366;color:#092f21;font-weight:900;text-decoration:none}
+          .sp-awaiting-panel{margin:18px 0;padding:16px}
+          .sp-awaiting-row{align-items:center}
+          .sp-goals-panel{margin:18px 0;padding:16px}
+          .sp-goals-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+          .sp-goal-card{padding:14px;border:1px solid #c7dfef;border-radius:12px;background:#fff}
+          .sp-goal-card p{margin:6px 0;color:#68829d}
+          .sp-goal-card>strong{display:block;margin:10px 0;font-size:18px}
+          .sp-goal-card small{color:#68829d}
+          .sp-progress{height:9px;overflow:hidden;border:1px solid #14243e;border-radius:20px;background:#e5edf4}
+          .sp-progress span{display:block;height:100%;border-radius:20px;background:linear-gradient(90deg,#53d4a2,#1686e7)}
+          .sp-goal-form{margin:16px 0}
+          .sp-monitor-panel{margin:16px 0;padding:16px}
+          .sp-monitor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px}
+          .sp-monitor-stat{padding:10px;border:1px solid #d6e5ef;border-radius:10px;background:#f7fbff;min-width:0}
+          .sp-monitor-stat small{display:block;color:#68829d;font-size:11px}
+          .sp-monitor-stat b{display:block;margin-top:4px;overflow-wrap:anywhere}
+          .sp-member-extras{display:grid;gap:14px;margin-top:16px}
+          .sp-extra-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+          .sp-extra-grid>.game-panel,.sp-member-extras>.game-panel{padding:15px}
+          .sp-achievement-list{display:grid;gap:9px}
+          .sp-achievement{display:grid;grid-template-columns:28px 1fr;gap:8px;padding:9px;border:1px solid #d6e5ef;border-radius:10px;background:#f8fbfd}
+          .sp-achievement>span{font-size:22px;color:#9aaaba}
+          .sp-achievement.earned{border-color:#53d4a2;background:#effcf6}
+          .sp-achievement.earned>span{color:#16976b}
+          .sp-achievement b,.sp-achievement small{display:block}
+          .sp-achievement small{margin-top:3px;color:#68829d}
+          .sp-achievement strong{grid-column:2;color:#68829d;font-size:9px;letter-spacing:.5px}
+          .sp-timeline{display:grid;gap:0}
+          .sp-timeline-item{display:grid;grid-template-columns:18px 1fr;gap:10px;min-height:48px}
+          .sp-timeline-item>i{position:relative;display:block;width:10px;height:10px;margin:5px 0 0 3px;border:2px solid #1686e7;border-radius:50%;background:#fff}
+          .sp-timeline-item:not(:last-child)>i:after{content:'';position:absolute;top:8px;left:2px;width:2px;height:42px;background:#c7dfef}
+          .sp-timeline-item b,.sp-timeline-item small{display:block}
+          .sp-timeline-item small{margin-top:3px;color:#68829d}
+          .sp-onboarding-backdrop{position:fixed;z-index:1000;inset:0;display:grid;place-items:center;padding:18px;background:#071a30bb}
+          .sp-onboarding{width:min(520px,100%);padding:24px;border:3px solid #14243e;border-radius:18px;background:#fffdf7;box-shadow:0 8px 0 #14243e;color:#14243e}
+          .sp-onboarding h2{margin:8px 0;font-size:28px}
+          .sp-onboarding p,.sp-onboarding li{line-height:1.55;color:#526b82}
+          .sp-onboarding ul{padding-left:22px}
+          @media(max-width:700px){.sp-extra-grid{grid-template-columns:1fr}.sp-awaiting-row{align-items:flex-start;flex-direction:column}.sp-onboarding{padding:18px}.sp-onboarding h2{font-size:23px}}
+          '''.replace('\n          ', '\n'), encoding='utf-8')
+
+          # Confere que o servidor nao ganhou permissao de servir arquivos internos e que nao houve exclusoes.
+          if 'STAR_PARK_WHATSAPP_COMMUNITY_URL' not in server or 'AWAITING_WHATSAPP' not in server:
+              raise SystemExit('Verificacao final do fluxo de recrutamento falhou.')
+          if "'/starpark-next.js'" not in server or "'/starpark-next.css'" not in server:
+              raise SystemExit('Os novos assets nao foram adicionados a allowlist de arquivos publicos.')
+          print('Atualizacao aplicada em memoria e gravada: recrutamento, preview, WhatsApp, contas compativeis, eventos, metas, monitoramento e Central do Jogador.')
+          PY
+          python3 /tmp/apply-starpark-update.py
+
+      - name: Validar sintaxe JavaScript e integridade do HTML/CSS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --check server.mjs
+          node --check public/app.js
+          node --check public/starpark-next.js
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          class CheckHTML(HTMLParser):
+              def error(self, message): raise RuntimeError(message)
+          parser=CheckHTML(); parser.feed(Path('public/index.html').read_text(encoding='utf-8')); parser.close()
+          css=Path('public/starpark-next.css').read_text(encoding='utf-8')
+          if css.count('{') != css.count('}'):
+              raise SystemExit('CSS com chaves desbalanceadas.')
+          html=Path('public/index.html').read_text(encoding='utf-8')
+          for marker in ['starpark-next.js','starpark-next.css','starparkAwaitingWhatsapp','spGoalForm','starparkSystemMonitor']:
+              if marker not in html: raise SystemExit(f'Marcador ausente no HTML: {marker}')
+          print('HTML e CSS passaram na verificacao estrutural.')
+          PY
+
+      - name: Instalar dependencias sem alterar o manifesto
+        shell: bash
+        run: npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+
+      - name: Executar todos os testes existentes
+        shell: bash
+        run: npm test
+
+      - name: Testes adicionais do novo fluxo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const server=fs.readFileSync('server.mjs','utf8');
+          const html=fs.readFileSync('public/index.html','utf8');
+          const next=fs.readFileSync('public/starpark-next.js','utf8');
+          assert.match(server,/status:'AWAITING_WHATSAPP'/);
+          assert.match(server,/reservationExpiresAt:null/);
+          assert.match(server,/whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL/);
+          assert.match(server,/m\.applicationId===app\.id/);
+          assert.match(server,/event-registration\/cancel/);
+          assert.match(server,/api\/public\/goals/);
+          assert.match(server,/username\|\|body\.email/);
+          assert.match(html,/starparkAwaitingWhatsapp/);
+          assert.match(html,/name="username"/);
+          assert.match(next,/Previa do perfil Brawl Stars/);
+          assert.match(next,/ENTRAR NA COMUNIDADE DO WHATSAPP/);
+          assert.match(next,/Linha do tempo/);
+          assert.match(next,/Conquistas e medalhas/);
+          assert.match(next,/Central de monitoramento/);
+          assert.match(next,/data-sp-close-goal/);
+          assert.match(next,/type=\"button\" class=\"mini-action danger\" data-sp-close-goal/);
+          console.log('Testes adicionais de integracao aprovados.');
+          NODE
+
+      - name: Verificar diff e impedir exclusoes inesperadas
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --check
+          if git diff --name-status | awk '$1 ~ /^D/ {found=1} END {exit found ? 0 : 1}'; then
+            echo 'ERRO: a atualizacao tentou excluir arquivos. Interrompendo.'
+            git diff --name-status
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, subprocess
+          before=json.loads(subprocess.check_output(['git','show','HEAD:package.json'],text=True))
+          after=json.load(open('package.json',encoding='utf-8'))
+          before['version']=after.get('version')
+          if after.get('version')!='5.1.0' or before!=after:
+              raise SystemExit('package.json sofreu alteracoes alem da versao 5.1.0.')
+          PY
+          git diff --stat
+
+      - name: Criar branch e enviar a atualizacao validada
+        id: publish
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if git diff --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Nenhuma mudanca nova foi necessaria.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BRANCH="star-park/grande-atualizacao-${GITHUB_RUN_NUMBER}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          git add package.json README.md server.mjs public/index.html public/app.js public/styles.css public/starpark-next.js public/starpark-next.css
+          git add lib/firestore-store.mjs
+          git commit -m "feat(star-park): grande atualizacao segura 5.1.0"
+          git push --set-upstream origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "### Atualizacao validada" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch: \\`$BRANCH\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Os testes passaram. A branch foi enviada sem alterar a branch principal.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Abrir Pull Request para revisao
+        if: steps.publish.outputs.changed == 'true' && inputs.criar_pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.publish.outputs.branch }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          EXISTING="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "Pull Request existente: $EXISTING" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh pr create --draft --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+            --title "STAR PARK 5.1.0 - Grande atualizacao segura" \
+            --body "## O que esta proposta atualiza\n- Candidatura encaminhada automaticamente para Aguardando WhatsApp, com link da comunidade.\n- Confirmacao manual e protecao contra membros duplicados.\n- Previa da tag Brawl Stars antes do envio.\n- Login compativel com nome de usuario e e-mail legado; senha minima de 6 caracteres para novas solicitacoes de conta.\n- Cancelamento de inscricao em eventos, conquistas, linha do tempo, notificacoes, metas coletivas, personalizacao de perfil, onboarding e monitoramento.\n\n## Validacao\n- Node 22 e verificacao de sintaxe.\n- npm test.\n- Testes adicionais do fluxo novo.\n- Nenhum arquivo excluido; package.json alterado somente para a versao 5.1.0.\n\nEsta PR nao altera dados de producao nem executa migracoes no Firestore. Revise antes de mesclar."
+
+      - name: Resumo final
+        if: always()
+        shell: bash
+        env:
+          BRANCH: ${{ steps.publish.outputs.branch }}
+          CHANGED: ${{ steps.publish.outputs.changed }}
+        run: |
+          {
+            echo '## STAR PARK - Resultado'
+            echo "- Resultado: ${{ job.status }}"
+            echo "- Branch proposta: ${BRANCH:-nao criada}"
+            echo "- Arquivos alterados: ${CHANGED:-nao confirmado}"
+            echo '- O workflow nao publica diretamente na branch principal.'
+            echo '- O workflow nao executa migracoes nem grava dados no Firestore.'
+            echo '- O backup de codigo-fonte esta nos artefatos desta execucao por 14 dias.'
+            echo '- Se a Pull Request nao puder ser aberta, use a branch criada para revisao manual.'
+          } >> "$GITHUB_STEP_SUMMARY"
