@@ -1,0 +1,910 @@
+name: STAR PARK 6.0.0 — Mega atualização integrada
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-park-6-mega-atualizacao
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    name: Backup, correções, testes e instalação da versão 6.0.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Baixar o código da branch principal
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Conferir a versão-base e os arquivos essenciais
+        id: guard
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Execute este workflow selecionando a branch main."
+            exit 1
+          fi
+          node -e "const p=require('./package.json'); if(!['5.1.0','6.0.0'].includes(p.version)) { console.error('Versão-base inesperada:',p.version); process.exit(1) }"
+          for file in package.json server.mjs public/index.html public/app.js public/styles.css public/starpark-next.js public/starpark-next.css lib/firestore-store.mjs; do
+            test -f "$file" || { echo "Arquivo essencial ausente: $file"; exit 1; }
+          done
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$VERSION" = "6.0.0" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "A versão 6.0.0 já está declarada. O workflow fará somente as verificações de integridade."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+            echo "Base 5.1.0 confirmada. Será aplicada a atualização 6.0.0."
+          fi
+
+      - name: Criar backup do código antes de alterar
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if git ls-files | grep -E '(^|/)(\.env|serviceAccountKey\.json|firebase-service-account[^/]*\.json|.*\.pem)$' > /tmp/starpark-sensitive.txt; then
+            echo "Foram encontrados arquivos sensíveis versionados; o backup foi interrompido por segurança."
+            cat /tmp/starpark-sensitive.txt
+            exit 1
+          fi
+          mkdir -p /tmp/starpark-backup
+          tar -czf /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz \
+            package.json README.md server.mjs public lib tests scripts firestore.rules docs .github/workflows
+          sha256sum /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz
+
+      - name: Guardar backup para recuperação
+        if: steps.guard.outputs.already != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: star-park-backup-antes-da-6.0.0-${{ github.run_number }}
+          path: /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Aplicar a atualização integrada com marcadores estritos
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > /tmp/apply-starpark-6.py <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          ROOT = Path.cwd()
+
+          def read(path):
+              return (ROOT / path).read_text(encoding="utf-8")
+
+          def write(path, content):
+              target = ROOT / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(content, encoding="utf-8", newline="\n")
+
+          def replace_once(path, old, new, label, expected=1):
+              source = read(path)
+              if new and new in source:
+                  print(f"OK já aplicado: {label}")
+                  return
+              count = source.count(old)
+              if count != expected:
+                  raise SystemExit(f"ABORTADO — {label}: esperado(s) {expected} marcador(es), encontrado(s) {count} em {path}.")
+              write(path, source.replace(old, new, expected))
+              print(f"OK aplicado: {label}")
+
+          def replace_line(path, prefix, replacement, label):
+              source = read(path)
+              lines = source.splitlines()
+              matches = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+              if len(matches) == 0 and replacement in source:
+                  print(f"OK já aplicado: {label}")
+                  return
+              if len(matches) != 1:
+                  raise SystemExit(f"ABORTADO — {label}: marcador de linha encontrado {len(matches)} vez(es) em {path}.")
+              lines[matches[0]:matches[0] + 1] = replacement.splitlines()
+              write(path, "\n".join(lines) + "\n")
+              print(f"OK aplicado: {label}")
+
+          def replace_regex(path, pattern, replacement, label, flags=0):
+              source = read(path)
+              if replacement in source:
+                  print(f"OK já aplicado: {label}")
+                  return
+              updated, count = re.subn(pattern, lambda _m: replacement, source, count=1, flags=flags)
+              if count != 1:
+                  raise SystemExit(f"ABORTADO — {label}: padrão encontrado {count} vez(es) em {path}.")
+              write(path, updated)
+              print(f"OK aplicado: {label}")
+
+          # ------------------------------------------------------------
+          # 1. Regras de domínio testáveis: aprovação real + identidade múltipla
+          # ------------------------------------------------------------
+          domain = r'''export function normalizePlayerTag(value) {
+            return String(value ?? '').replace(/^#/, '').replace(/\s+/g, '').toUpperCase();
+          }
+
+          export function applicationWasApproved(application) {
+            if (!Array.isArray(application?.history)) return false;
+            const finalDecision = application.history.slice().reverse().find(entry => ['APPROVED', 'REJECTED', 'CANCELLED'].includes(entry?.status));
+            return finalDecision?.status === 'APPROVED';
+          }
+
+          export function memberAccountEligible(member, applications) {
+            if (!member || member.status !== 'ACTIVE' || !member.applicationId || !Array.isArray(applications)) return false;
+            const application = applications.find(item => item?.id === member.applicationId);
+            if (!application || application.status !== 'ACTIVE' || !applicationWasApproved(application)) return false;
+            const originalTag = normalizePlayerTag(application.playerTag);
+            const acceptedTags = new Set([
+              normalizePlayerTag(member.playerTag),
+              ...(Array.isArray(member.previousPlayerTags) ? member.previousPlayerTags.map(normalizePlayerTag) : []),
+              ...(Array.isArray(member.tagHistory) ? member.tagHistory.map(item => normalizePlayerTag(item?.playerTag)) : []),
+            ].filter(Boolean));
+            return Boolean(originalTag && acceptedTags.has(originalTag));
+          }
+
+          export function accountRoles(user) {
+            const roles = new Set(Array.isArray(user?.roles) ? user.roles : []);
+            if (user?.role) roles.add(user.role);
+            if (user?.memberId) roles.add('MEMBER');
+            return [...roles];
+          }
+          '''
+          write("lib/star-park-domain.mjs", domain)
+
+          tests = r'''import test from 'node:test';
+          import assert from 'node:assert/strict';
+          import { applicationWasApproved, memberAccountEligible, accountRoles } from '../lib/star-park-domain.mjs';
+
+          const approvedApplication = {
+            id: 'app-1', playerTag: '#ABC123', status: 'ACTIVE',
+            history: [{ status: 'PENDING' }, { status: 'IN_REVIEW' }, { status: 'APPROVED' }, { status: 'AWAITING_WHATSAPP' }],
+          };
+          const activeMember = { id: 'mem-1', applicationId: 'app-1', playerTag: 'ABC123', status: 'ACTIVE' };
+
+          test('somente histórico com aprovação explícita conta como candidatura aprovada', () => {
+            assert.equal(applicationWasApproved(approvedApplication), true);
+            assert.equal(applicationWasApproved({ status: 'AWAITING_WHATSAPP', history: [{ status: 'PENDING' }] }), false);
+            assert.equal(applicationWasApproved({ status: 'ACTIVE', history: [{ status: 'ACTIVE' }] }), false);
+            assert.equal(applicationWasApproved({ status: 'REJECTED', history: [{ status: 'APPROVED' }, { status: 'REJECTED' }] }), false);
+          });
+
+          test('solicitação de conta exige membro ativo, candidatura vinculada e aprovada', () => {
+            assert.equal(memberAccountEligible(activeMember, [approvedApplication]), true);
+            assert.equal(memberAccountEligible({ ...activeMember, status: 'SUSPENDED' }, [approvedApplication]), false);
+            assert.equal(memberAccountEligible({ ...activeMember, applicationId: null }, [approvedApplication]), false);
+            assert.equal(memberAccountEligible(activeMember, [{ ...approvedApplication, history: [{ status: 'PENDING' }] }]), false);
+            assert.equal(memberAccountEligible(activeMember, [{ ...approvedApplication, status: 'AWAITING_WHATSAPP' }]), false);
+            assert.equal(memberAccountEligible(activeMember, [{ ...approvedApplication, status: 'REJECTED' }]), false);
+          });
+
+          test('correção de tag não rompe o vínculo com a candidatura original', () => {
+            const corrected = { ...activeMember, playerTag: 'NEW999', previousPlayerTags: ['ABC123'] };
+            assert.equal(memberAccountEligible(corrected, [approvedApplication]), true);
+            assert.equal(memberAccountEligible({ ...corrected, previousPlayerTags: [] }, [approvedApplication]), false);
+          });
+
+          test('uma conta administrativa vinculada recebe também o papel de membro', () => {
+            assert.deepEqual(accountRoles({ role: 'ADMIN', memberId: 'mem-1' }), ['ADMIN', 'MEMBER']);
+            assert.deepEqual(accountRoles({ role: 'MEMBER', memberId: 'mem-1' }), ['MEMBER']);
+            assert.deepEqual(accountRoles({ role: 'OWNER' }), ['OWNER']);
+          });
+          '''
+          write("tests/star-park-domain.test.mjs", tests)
+
+          auth_test = r'''test('OWNER autentica, envia candidatura, aprova, confirma WhatsApp e cria membro',async()=>{
+           const login=await request('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:ownerEmail,password:ownerPassword})});assert.equal(login.status,200);ownerCookies=login.headers.getSetCookie();assert.ok(ownerCookies.some(c=>c.startsWith('sp_session=')));csrf=ownerCookies.find(c=>c.startsWith('sp_csrf='))?.split(';')[0].split('=')[1];assert.ok(csrf);
+           const session=await request('/api/session',{headers:{cookie:cookieHeader(ownerCookies)}});assert.equal((await session.json()).user.role,'OWNER');
+           const submitted=await request('/api/applications',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({displayName:'Membro de Teste',gameNickname:'Tester',playerTag:'PYLQG',ageRange:'18-24',phone:'+5511999999999',phoneType:'self',desiredBrawlerId:'shelly',privacyAcknowledged:true})});assert.equal(submitted.status,201);const application=await submitted.json();assert.equal(application.status,'PENDING');
+           const early=await request('/api/member/account-requests',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({playerTag:'#PYLQG',email:'early@example.test',password:'StrongEarlyPass!2026'})});assert.equal(early.status,409,'conta não pode ser solicitada antes de aprovação e ativação');
+           for(const status of ['IN_REVIEW','APPROVED','AWAITING_WHATSAPP']){const transition=await request(`/api/admin/applications/${application.applicationId}/transition`,{method:'POST',headers:{'content-type':'application/json','cookie':cookieHeader(ownerCookies),'x-csrf-token':decodeURIComponent(csrf)},body:JSON.stringify({status,reason:'Teste automatizado do fluxo de recrutamento.'})});assert.equal(transition.status,200,`falha ao avançar para ${status}`);}
+           const activation=await request(`/api/admin/applications/${application.applicationId}/confirm-whatsapp`,{method:'POST',headers:{'content-type':'application/json','cookie':cookieHeader(ownerCookies),'x-csrf-token':decodeURIComponent(csrf)},body:'{}'});assert.equal(activation.status,200);memberId=(await activation.json()).memberId;
+          });'''
+          replace_line(
+              "tests/auth.test.mjs",
+              "test('OWNER autentica, recebe sessão e cria membro'",
+              auth_test,
+              "atualizar teste de integração para exigir aprovação e confirmação de WhatsApp",
+          )
+
+          # ------------------------------------------------------------
+          # 2. Backend: papéis combinados, permissões e brawlers sem inventar dados
+          # ------------------------------------------------------------
+          replace_once(
+              "server.mjs",
+              "import {aggregateBattleStats, extractBattleRecords, normalizePlayerStats} from './lib/brawl-stats.mjs';",
+              "import {aggregateBattleStats, extractBattleRecords, normalizePlayerStats} from './lib/brawl-stats.mjs';\nimport {applicationWasApproved, memberAccountEligible, accountRoles} from './lib/star-park-domain.mjs';",
+              "importar regras de domínio",
+          )
+          replace_once(
+              "server.mjs",
+              "function hasPermission(user, permission){return Boolean(user && (user.role==='OWNER' || (user.permissions||rolePermissions[user.role]||[]).includes('*') || (user.permissions||rolePermissions[user.role]||[]).includes(permission)));}",
+              "function hasPermission(user, permission){const roles=accountRoles(user);const granted=user?.permissions||rolePermissions[user?.role]||[];return Boolean(user&&(roles.includes('OWNER')||granted.includes('*')||granted.includes(permission)||(permission==='member.self'&&roles.includes('MEMBER'))));}",
+              "permissões baseadas em todos os papéis da identidade",
+          )
+          replace_once(
+              "server.mjs",
+              "function publicUser(user){return {id:user.id,name:user.name,username:user.username||null,email:user.email||null,role:user.role,permissions:user.permissions||rolePermissions[user.role]||[],createdAt:user.createdAt};}",
+              "function publicUser(user){const roles=accountRoles(user);const permissions=new Set(user.permissions||rolePermissions[user.role]||[]);if(roles.includes('MEMBER'))permissions.add('member.self');return {id:user.id,name:user.name,username:user.username||null,email:user.email||null,role:user.role,roles,memberId:user.memberId||null,disabled:Boolean(user.disabled),permissions:[...permissions],createdAt:user.createdAt};}",
+              "expor papéis combinados sem remover o papel legado",
+          )
+          replace_once(
+              "server.mjs",
+              "const validNumber = (v) => v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));",
+              "const validNumber = (v) => v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));\nfunction normalizeOwnedBrawlers(items){if(!Array.isArray(items))return [];const normalizeItems=list=>(Array.isArray(list)?list:[]).slice(0,20).map(value=>{if(typeof value==='number')return {id:validNumber(value)?Number(value):null,name:null};if(typeof value==='string')return {id:validNumber(value)?Number(value):null,name:validNumber(value)?null:(safeText(value,80)||null)};return {id:validNumber(value?.id)?Number(value.id):null,name:safeText(value?.name,80)||null};}).filter(item=>item.id!==null||item.name);return items.slice(0,120).map(b=>({id:b?.id??null,name:safeText(b?.name,80),trophies:validNumber(b?.trophies)?Number(b.trophies):null,highestTrophies:validNumber(b?.highestTrophies)?Number(b.highestTrophies):null,power:validNumber(b?.power)?Number(b.power):null,rank:validNumber(b?.rank)?Number(b.rank):null,gadgets:normalizeItems(b?.gadgets),starPowers:normalizeItems(b?.starPowers),gears:normalizeItems(b?.gears)})).filter(b=>b.name);}",
+              "normalizar equipamento individual de Brawlers somente quando a API fornecer",
+          )
+          replace_once(
+              "server.mjs",
+              "brawlers:Array.isArray(p.brawlers)?p.brawlers.map(b=>({id:b.id??null,name:b.name,trophies:validNumber(b.trophies)?Number(b.trophies):null,highestTrophies:validNumber(b.highestTrophies)?Number(b.highestTrophies):null,power:validNumber(b.power)?Number(b.power):null,rank:validNumber(b.rank)?Number(b.rank):null})):[],",
+              "brawlers:normalizeOwnedBrawlers(p.brawlers),",
+              "preservar gadgets, poderes e equipamentos reais no perfil",
+          )
+          replace_once(
+              "server.mjs",
+              "brawlers:Array.isArray(api.player.brawlers)?api.player.brawlers.map(b=>({id:b.id??null,name:b.name,trophies:validNumber(b.trophies)?Number(b.trophies):null,highestTrophies:validNumber(b.highestTrophies)?Number(b.highestTrophies):null,power:validNumber(b.power)?Number(b.power):null,rank:validNumber(b.rank)?Number(b.rank):null})):[],",
+              "brawlers:api?normalizeOwnedBrawlers(api.player.brawlers):[],",
+              "preservar equipamento na captura inicial de baseline",
+          )
+
+          # Migração aditiva: papéis e perfis existentes são preservados; candidaturas sem aprovação voltam à análise.
+          migration = r'''  const legacyActivatedApplications=store.applications.filter(application=>application.status==='ACTIVE'&&!applicationWasApproved(application)&&!(Array.isArray(application.history)&&application.history.some(entry=>entry?.status==='REJECTED')));
+            for(let offset=0;offset<legacyActivatedApplications.length;offset+=100){
+              const batchIds=new Set(legacyActivatedApplications.slice(offset,offset+100).map(application=>application.id));
+              await mutate(()=>{for(const application of store.applications.filter(item=>batchIds.has(item.id)&&item.status==='ACTIVE'&&!applicationWasApproved(item)&&!(Array.isArray(item.history)&&item.history.some(entry=>entry?.status==='REJECTED')))){application.history=Array.isArray(application.history)?application.history:[];const activation=application.history.find(entry=>entry?.status==='ACTIVE');const approval={status:'APPROVED',at:activation?.at||application.updatedAt||application.createdAt||nowISO(),by:'Migração Star Park 6.0.0',reason:'Elegibilidade preservada: a entrada já havia sido ativada após confirmação manual no fluxo anterior.'};const activeIndex=application.history.findIndex(entry=>entry?.status==='ACTIVE');application.history.splice(activeIndex>=0?activeIndex:application.history.length,0,approval);audit(null,'Aprovação histórica preservada',`${application.displayName} • ${application.playerTag}`);}});
+            }
+            if(legacyActivatedApplications.length)console.info(`[STAR PARK] ${legacyActivatedApplications.length} membro(s) já ativado(s) tiveram a aprovação histórica preservada.`);
+            const bypassedApplications=store.applications.filter(application=>application.status==='AWAITING_WHATSAPP'&&!applicationWasApproved(application));
+            for(let offset=0;offset<bypassedApplications.length;offset+=100){
+              const batchIds=new Set(bypassedApplications.slice(offset,offset+100).map(application=>application.id));
+              await mutate(()=>{for(const application of store.applications.filter(item=>batchIds.has(item.id)&&item.status==='AWAITING_WHATSAPP'&&!applicationWasApproved(item))){application.status='PENDING';application.updatedAt=nowISO();application.reservationExpiresAt=null;application.history=Array.isArray(application.history)?application.history:[];application.history.push({status:'PENDING',at:nowISO(),by:'Sistema 6.0.0',reason:'Revisão de segurança: a candidatura não tinha registro de aprovação administrativa.'});audit(null,'Candidatura devolvida para análise',`${application.displayName} • ${application.playerTag}`);}});
+            }
+            if(bypassedApplications.length)console.info(`[STAR PARK] ${bypassedApplications.length} candidatura(s) sem aprovação explícita voltaram para análise.`);
+          '''
+          replace_once(
+              "server.mjs",
+              "  if(OWNER_EMAIL&&OWNER_PASSWORD){",
+              migration + "  if(OWNER_EMAIL&&OWNER_PASSWORD){",
+              "migrar candidaturas antigas que avançaram sem aprovação explícita",
+          )
+
+          # Guardar os dados públicos da API no instante da candidatura para facilitar a triagem.
+          replace_once(
+              "server.mjs",
+              "      let apiLookupStatus='PENDING',trophiesAtApplication=null,applicationTrophiesCapturedAt=null,verifiedNickname=gameNickname;",
+              "      let apiLookupStatus='PENDING',trophiesAtApplication=null,applicationTrophiesCapturedAt=null,verifiedNickname=gameNickname,playerStatsAtApplication=null,clubAtApplication=null,brawlersAtApplication=[];",
+              "preparar snapshot de perfil da API para a análise administrativa",
+          )
+          replace_once(
+              "server.mjs",
+              "      try{const api=await fetchPlayer(tag);apiLookupStatus='OK';trophiesAtApplication=validNumber(api.player.trophies)?Number(api.player.trophies):null;applicationTrophiesCapturedAt=api.fetchedAt;verifiedNickname=api.player.name||gameNickname;}catch(e){apiLookupStatus='UNAVAILABLE';}",
+              "      try{const api=await fetchPlayer(tag);apiLookupStatus='OK';trophiesAtApplication=validNumber(api.player.trophies)?Number(api.player.trophies):null;applicationTrophiesCapturedAt=api.fetchedAt;verifiedNickname=api.player.name||gameNickname;playerStatsAtApplication=normalizePlayerStats(api.player);clubAtApplication=safeText(api.player.club?.name,80)||null;brawlersAtApplication=normalizeOwnedBrawlers(api.player.brawlers).slice(0,12);}catch(e){apiLookupStatus='UNAVAILABLE';}",
+              "capturar troféus, clube, estatísticas e Brawlers informados pela API sem criar valores",
+          )
+          # ------------------------------------------------------------
+          # 3. Recrutamento: sempre PENDING; WhatsApp não substitui aprovação
+          # ------------------------------------------------------------
+          replace_regex(
+              "server.mjs",
+              r"const application=\{id:id\(\),displayName,gameNickname:verifiedNickname,playerTag:tag,ageRange,phone,phoneType,desiredBrawlerId:brawler.id,desiredBrawlerKey:brawler.key,desiredBrawlerName:brawler.name,motivation,status:'AWAITING_WHATSAPP',apiLookupStatus,trophiesAtApplication,applicationTrophiesCapturedAt,wantsMemberAccount:body\.wantsMemberAccount===true,submittedAt:nowISO\(\),createdAt:nowISO\(\),updatedAt:nowISO\(\),privateNotes:\[\],history:\[\{status:'AWAITING_WHATSAPP',at:nowISO\(\),by:'Sistema',reason:'Avanco automatico para confirmacao manual de entrada na comunidade WhatsApp\.'\}\],reservationExpiresAt:null,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL\};",
+              "const application={id:id(),displayName,gameNickname:verifiedNickname,playerTag:tag,ageRange,phone,phoneType,desiredBrawlerId:brawler.id,desiredBrawlerKey:brawler.key,desiredBrawlerName:brawler.name,motivation,status:'PENDING',apiLookupStatus,trophiesAtApplication,applicationTrophiesCapturedAt,playerStatsAtApplication,clubAtApplication,brawlersAtApplication,submittedAt:nowISO(),createdAt:nowISO(),updatedAt:nowISO(),privateNotes:[],history:[{status:'PENDING',at:nowISO(),by:'Sistema',reason:'Candidatura recebida e encaminhada para análise administrativa.'}],reservationExpiresAt:null,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL};",
+              "não permitir que o envio pule a análise administrativa",
+          )
+          replace_line(
+              "server.mjs",
+              "      await mutate(()=>{if(!store.settings.recruitmentOpen)",
+              "      await mutate(()=>{if(!store.settings.recruitmentOpen)throw httpError(403,store.settings.recruitmentClosedMessage||'O recrutamento está fechado.');if(brawlerState(brawler.key)!=='AVAILABLE')throw httpError(409,'Este Brawler foi reservado por outra candidatura. Escolha outro.');if(store.applications.some(a=>cleanTag(a.playerTag)===tag&&activeStatuses.has(a.status))||store.members.some(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE'))throw httpError(409,'Já existe uma candidatura ativa ou vínculo cadastrado para esta tag.');store.applications.unshift(application);audit(null,'Candidatura recebida',`${displayName} • ${tag} • ${brawler.name}`);});return sendJSON(res,201,{ok:true,applicationId:application.id,status:application.status,apiLookupStatus,whatsappCommunityUrl:WHATSAPP_COMMUNITY_URL,message:'Candidatura recebida para análise. Você pode entrar no WhatsApp enquanto aguarda; isso não significa aprovação. Após a aprovação e confirmação da equipe, poderá solicitar sua conta de membro.'});",
+              "informar corretamente o status inicial e o próximo passo",
+          )
+
+          # Confirmar WhatsApp exige prova anterior de aprovação no histórico.
+          replace_once(
+              "server.mjs",
+              "if(app.status!=='AWAITING_WHATSAPP')throw httpError(409,'A candidatura precisa estar aguardando confirmação do WhatsApp.');",
+              "if(app.status!=='AWAITING_WHATSAPP'||!applicationWasApproved(app))throw httpError(409,'A candidatura precisa estar aprovada pela administração e aguardando confirmação do WhatsApp.');",
+              "proteger endpoint de ativação do membro",
+          )
+          replace_once(
+              "server.mjs",
+              "if(app.status!=='AWAITING_WHATSAPP'||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura ou a reserva mudou durante a ativação. Recarregue a lista.');",
+              "if(app.status!=='AWAITING_WHATSAPP'||!applicationWasApproved(app)||brawlerState(brawler.key)!=='RESERVED')throw httpError(409,'A candidatura aprovada ou a reserva mudou durante a ativação. Recarregue a lista.');",
+              "revalidar aprovação dentro da mutação serializada",
+          )
+
+          # ------------------------------------------------------------
+          # 4. Solicitação/ aprovação de conta: somente candidaturas aprovadas
+          # ------------------------------------------------------------
+          replace_once(
+              "server.mjs",
+              "const member=store.members.find(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE');\n      if(!member)throw httpError(409,'Não encontramos um membro ativo com essa tag. A administração precisa cadastrar e ativar sua entrada na House primeiro.');",
+              "const member=store.members.find(m=>cleanTag(m.playerTag)===tag&&m.status==='ACTIVE');\n      if(!member)throw httpError(409,'Não encontramos um membro ativo com essa tag. A administração precisa confirmar sua entrada primeiro.');\n      if(!memberAccountEligible(member,store.applications))throw httpError(409,'A solicitação de conta só está disponível após candidatura aprovada e entrada confirmada pela equipe.');",
+              "exigir candidatura aprovada no pedido de conta",
+          )
+          replace_once(
+              "server.mjs",
+              "store.users.some(u=>u.role==='MEMBER'&&u.memberId===member.id)",
+              "store.users.some(u=>u.memberId===member.id&&accountRoles(u).includes('MEMBER'))",
+              "detectar conta de membro mesmo quando vinculada a ADMIN",
+              expected=2,
+          )
+          replace_once(
+              "server.mjs",
+              "store.users.some(u=>u.role==='MEMBER'&&u.memberId===currentMember.id)",
+              "store.users.some(u=>u.memberId===currentMember.id&&accountRoles(u).includes('MEMBER'))",
+              "impedir duplicidade durante a gravação serializada",
+          )
+          replace_once(
+              "server.mjs",
+              "if(!currentMember)throw httpError(409,'O vínculo do jogador mudou. Peça à administração para confirmar seu cadastro.');",
+              "if(!currentMember||!memberAccountEligible(currentMember,store.applications))throw httpError(409,'O vínculo ou a aprovação da candidatura mudou. Peça à administração para conferir seu cadastro.');",
+              "revalidar elegibilidade do pedido no momento da gravação",
+          )
+          replace_once(
+              "server.mjs",
+              "if(!member)throw httpError(409,'O vínculo do jogador não está mais ativo. Revalide o cadastro do membro antes de aprovar.');",
+              "if(!member||!memberAccountEligible(member,store.applications))throw httpError(409,'O vínculo ativo ou a aprovação da candidatura não está mais válido.');",
+              "revalidar aprovação antes de liberar login",
+          )
+          replace_once(
+              "server.mjs",
+              "role:'MEMBER',memberId:member.id,permissions:defaultPermissions('MEMBER'),",
+              "role:'MEMBER',roles:['MEMBER'],memberId:member.id,permissions:defaultPermissions('MEMBER'),",
+              "criar conta aprovada com papel explícito de membro",
+          )
+
+          # ------------------------------------------------------------
+          # 5. Criação de usuário e consolidação de identidade
+          # ------------------------------------------------------------
+          admin_users = r'''       if(req.method==='POST'&&url.pathname==='/api/admin/users'){
+                   checkCsrf(req);if(user?.role!=='OWNER')throw httpError(403,'Somente o OWNER pode criar contas e convites.');
+                   const body=await bodyJSON(req);const name=safeText(body.name,60),username=safeText(body.username,24).toLowerCase(),email=safeText(body.email,180).toLowerCase(),password=String(body.password||''),role=safeText(body.role,20),memberId=safeText(body.memberId,80)||null;
+                   if(!name||(!username&&!email.includes('@'))||(username&&!/^[a-z0-9._-]{3,24}$/.test(username))||(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))||password.length<12||password.length>128||!['MEMBER','ADMIN'].includes(role))throw httpError(400,'Dados inválidos. Informe usuário/e-mail válido e senha com pelo menos 12 caracteres.');
+                   if(store.users.some(u=>(username&&u.username===username)||(email&&u.email===email)))throw httpError(409,'Já existe uma conta com este usuário ou e-mail.');
+                   if(role==='MEMBER'&&!memberId)throw httpError(400,'Associe a conta MEMBER a um membro ativo e aprovado.');
+                   let linkedMember=null;
+                   if(memberId){linkedMember=store.members.find(m=>m.id===memberId&&m.status==='ACTIVE');if(!linkedMember||!memberAccountEligible(linkedMember,store.applications))throw httpError(409,'Só é possível vincular uma conta a um membro ativo com candidatura aprovada.');if(store.users.some(u=>u.memberId===memberId&&accountRoles(u).includes('MEMBER')))throw httpError(409,'Este membro já possui uma conta vinculada. Use a consolidação de identidade para reaproveitar um acesso existente.');}
+                   const salt=crypto.randomBytes(16).toString('hex');const passwordHash=(await scrypt(password,salt,64)).toString('hex');
+                   const created={id:id(),name,username:username||null,email:email||null,role,roles:memberId?[role,'MEMBER']:[role],memberId,permissions:defaultPermissions(role),salt,passwordHash,createdAt:nowISO(),disabled:false};
+                   await mutate(()=>{if(store.users.some(u=>(username&&u.username===username)||(email&&u.email===email)))throw httpError(409,'Já existe uma conta com este usuário ou e-mail.');if(memberId&&(!memberAccountEligible(store.members.find(m=>m.id===memberId&&m.status==='ACTIVE'),store.applications)||store.users.some(u=>u.memberId===memberId&&accountRoles(u).includes('MEMBER'))))throw httpError(409,'O membro ou a conta vinculada mudou. Atualize a tela.');store.users.push(created);audit(user,'Conta criada',`${username||email} • ${role}${memberId?' + MEMBER':''}`);});
+                   return sendJSON(res,201,{ok:true,user:publicUser(created)});
+                 }
+                 const linkMember=url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/link-member$/);
+                 if(req.method==='POST'&&linkMember){
+                   checkCsrf(req);if(user?.role!=='OWNER')throw httpError(403,'Somente o OWNER pode consolidar identidades.');
+                   const body=await bodyJSON(req,4000);const memberId=safeText(body.memberId,80),mergeFromUserId=safeText(body.mergeFromUserId,80);const target=store.users.find(u=>u.id===linkMember[1]&&!u.disabled);const member=store.members.find(m=>m.id===memberId&&m.status==='ACTIVE');
+                   if(!target||!['ADMIN','OWNER'].includes(target.role))throw httpError(404,'Conta administrativa de destino não encontrada.');
+                   if(!member||!memberAccountEligible(member,store.applications))throw httpError(409,'O membro precisa ter entrada ativa e candidatura aprovada.');
+                   if(target.memberId&&target.memberId!==member.id)throw httpError(409,'Esta conta já está vinculada a outro membro.');
+                   const other=store.users.find(u=>u.id!==target.id&&u.memberId===member.id&&accountRoles(u).includes('MEMBER')&&!u.disabled);
+                   if(other&&other.id!==mergeFromUserId)throw httpError(409,'Já existe outra conta de membro. Selecione-a no campo de consolidação para manter apenas um login.');
+                   if(mergeFromUserId&&(!other||other.id!==mergeFromUserId||other.role!=='MEMBER'))throw httpError(409,'A conta de membro selecionada não corresponde a este jogador.');
+                   await mutate(()=>{const currentTarget=store.users.find(u=>u.id===target.id&&!u.disabled);const currentMember=store.members.find(m=>m.id===member.id&&m.status==='ACTIVE');const currentOther=mergeFromUserId?store.users.find(u=>u.id===mergeFromUserId&&!u.disabled):null;if(!currentTarget||!currentMember||!memberAccountEligible(currentMember,store.applications))throw httpError(409,'A conta ou o vínculo mudou durante a operação.');if(currentOther&&(currentOther.role!=='MEMBER'||currentOther.memberId!==currentMember.id))throw httpError(409,'A conta antiga não corresponde ao membro.');if(currentOther){currentOther.disabled=true;currentOther.disabledAt=nowISO();currentOther.mergedInto=currentTarget.id;currentOther.mergeReason='Identidade consolidada pelo OWNER na versão 6.0.0.';}currentTarget.memberId=currentMember.id;currentTarget.roles=[...new Set([...accountRoles(currentTarget),'MEMBER'])];audit(user,'Identidade administrativa e de membro consolidada',`${currentTarget.name} • ${currentMember.displayName} • ${currentOther?'conta anterior desativada e preservada':'vínculo criado'}`);});
+                   return sendJSON(res,200,{ok:true,user:publicUser(store.users.find(u=>u.id===target.id))});
+                 }
+          '''
+          replace_line(
+              "server.mjs",
+              "      if(req.method==='POST'&&url.pathname==='/api/admin/users')",
+              admin_users.rstrip(),
+              "permitir conta ADMIN+MEMBER e consolidar logins sem apagar o registro antigo",
+          )
+
+          # ------------------------------------------------------------
+          # 6. Correção de tag: consulta API, confirmação e histórico separado
+          # ------------------------------------------------------------
+          tag_route = r'''       const changePlayerTag=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/player-tag$/);
+                 if(req.method==='POST'&&changePlayerTag){
+                   checkCsrf(req);requirePermission(user,'members.write');const body=await bodyJSON(req,5000);const tag=cleanTag(body.playerTag),expectedName=safeText(body.confirmNickname,40),reason=safeText(body.reason,250);
+                   if(!tagIsValid(tag)||reason.length<5)throw httpError(400,'Informe uma tag válida e uma justificativa com pelo menos 5 caracteres.');
+                   const member=store.members.find(m=>m.id===changePlayerTag[1]);if(!member)throw httpError(404,'Membro não encontrado.');if(cleanTag(member.playerTag)===tag)throw httpError(409,'Esta tag já está cadastrada neste perfil.');
+                   if(store.members.some(m=>m.id!==member.id&&m.status==='ACTIVE'&&cleanTag(m.playerTag)===tag))throw httpError(409,'Esta tag já pertence a outro membro ativo.');
+                   if(store.applications.some(a=>a.id!==member.applicationId&&activeStatuses.has(a.status)&&cleanTag(a.playerTag)===tag))throw httpError(409,'Esta tag está reservada por outra candidatura ativa.');
+                   const api=await fetchPlayer(tag,true);const player=api.player||{};const actualName=safeText(player.name,40);if(!actualName)throw httpError(404,'A API não encontrou um perfil válido para esta tag.');
+                   if(actualName.toLocaleLowerCase('pt-BR')!==expectedName.toLocaleLowerCase('pt-BR'))throw httpError(409,`Confirmação diferente do perfil encontrado. A API retornou: ${actualName}.`);
+                   const capturedAt=api.fetchedAt||nowISO();const trophies=validNumber(player.trophies)?Number(player.trophies):null;const battleRecords=extractBattleRecords(api.battlelog,tag,member.id);const newBrawlers=normalizeOwnedBrawlers(player.brawlers);
+                   await mutate(()=>{const current=store.members.find(m=>m.id===member.id);if(!current)throw httpError(404,'Membro não encontrado.');if(store.members.some(m=>m.id!==current.id&&m.status==='ACTIVE'&&cleanTag(m.playerTag)===tag))throw httpError(409,'A tag foi vinculada a outro membro durante a operação.');if(store.applications.some(a=>a.id!==current.applicationId&&activeStatuses.has(a.status)&&cleanTag(a.playerTag)===tag))throw httpError(409,'A tag foi reservada por outra candidatura durante a operação.');const oldTag=cleanTag(current.playerTag);const archived={playerTag:oldTag,gameNickname:current.gameNickname||null,changedAt:nowISO(),changedBy:user.id,reason,baselineTrophies:current.baselineTrophies??null,currentTrophies:current.currentTrophies??null,playerStats:current.playerStats||null,brawlers:current.brawlers||[],recentBattles:current.recentBattles||[],apiSyncStatus:current.apiSyncStatus||null,apiSyncError:current.apiSyncError||null,trophyHistory:current.trophyHistory||[],battleHistory:current.battleHistory||[],battleUsage:current.battleUsage||null};current.tagHistory=[...(current.tagHistory||[]),archived];current.previousPlayerTags=[...new Set([...(current.previousPlayerTags||[]),oldTag].filter(Boolean))];current.playerTag=tag;current.gameNickname=actualName;current.currentTrophies=trophies;current.currentTrophiesCapturedAt=capturedAt;current.baselineTrophies=trophies;current.baselineCapturedAt=trophies===null?null:capturedAt;current.baselineStatus=trophies===null?'PENDING_CAPTURE':'CAPTURED';current.playerStats=normalizePlayerStats(player);current.brawlers=newBrawlers;current.apiSyncStatus=api.battlelogAvailable?'OK':'PARTIAL';current.apiSyncError=api.battlelogError||null;current.lastSyncAttemptAt=capturedAt;current.lastBattleLogSyncAt=api.battlelogAvailable?capturedAt:(current.lastBattleLogSyncAt||null);current.trophyHistory=trophies===null?[]:[{trophies,capturedAt,source:'tag-correction-baseline'}];current.battleHistory=[];current.battleUsage={totalObserved:0,wins:0,losses:0,draws:0,brawlers:{},modes:{}};current.recentBattles=(api.battlelog||[]).map(x=>({brawlerName:battleBrawlerName(x,tag)})).filter(x=>x.brawlerName);applyBattleRecords(current,battleRecords);if(trophies!==null)store.snapshots.push({id:id(),memberId:current.id,trophies,capturedAt,source:'tag-correction-baseline',syncStatus:'CAPTURED'});audit(user,'Tag de membro corrigida',`${current.displayName}: #${oldTag} → #${tag} • API: ${actualName} • Motivo: ${reason}`);});
+                   playerCache.delete(tag);return sendJSON(res,200,{ok:true,playerTag:tag,gameNickname:actualName,currentTrophies:trophies,baselineStatus:trophies===null?'PENDING_CAPTURE':'CAPTURED'});
+                 }
+          '''
+          replace_once(
+              "server.mjs",
+              r"      const memberStatus=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/status$/);",
+              tag_route + r"      const memberStatus=url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/status$/);",
+              "adicionar alteração segura de tag com arquivo de histórico por conta",
+          )
+
+          # ------------------------------------------------------------
+          # 7. Frontend: autorização por múltiplos papéis e troca de espaços
+          # ------------------------------------------------------------
+          replace_once(
+              "public/app.js",
+              "function setPage(name){\n const isMemberPage=name.startsWith('member-')&&name!=='member-gate';\n const isAdminPage=name.startsWith('admin-')&&name!=='admin-gate';\n if(isMemberPage&&auth.user?.role!=='MEMBER')name='member-gate';\n if(isAdminPage&&(!auth.user||auth.user.role==='MEMBER'))name='admin-gate';",
+              "function userHasRole(role,user=auth.user){const roles=Array.isArray(user?.roles)?user.roles:[user?.role].filter(Boolean);return roles.includes(role)||(role==='ADMIN'&&roles.some(item=>['OWNER','MODERATOR'].includes(item)));}\nwindow.starParkHasRole=userHasRole;\nfunction setPage(name){\n const isMemberPage=name.startsWith('member-')&&name!=='member-gate';\n const isAdminPage=name.startsWith('admin-')&&name!=='admin-gate';\n if(isMemberPage&&!userHasRole('MEMBER'))name='member-gate';\n if(isAdminPage&&!userHasRole('ADMIN'))name='admin-gate';",
+              "liberar páginas de membro e administração conforme os papéis combinados",
+          )
+          replace_once(
+              "public/app.js",
+              " const u=auth.user;$('#sideIdentity').textContent=u?.name||'Visitante';$('#sideRole').textContent=u?roleName(u.role):'Acesso público';$('#topIdentity').textContent=u?initials(u.name):'SP';\n $('#topAccessButton').textContent=u?'MEU ESPAÇO':'ENTRAR';$('#topLogoutButton').hidden=!u;\n $('#sidebarSectionLabel').textContent=u?(u.role==='MEMBER'?'ESPAÇO DO MEMBRO':'CENTRAL ADMINISTRATIVA'):'EXPLORAR A STAR PARK';",
+              "  const u=auth.user;const labels=(u?.roles||[u?.role]).filter(Boolean).map(roleName);$('#sideIdentity').textContent=u?.name||'Visitante';$('#sideRole').textContent=u?labels.join(' + '):'Acesso público';$('#topIdentity').textContent=u?initials(u.name):'SP';\n  $('#topAccessButton').textContent=u?'MEU ESPAÇO':'ENTRAR';$('#topLogoutButton').hidden=!u;\n  $('#sidebarSectionLabel').textContent=u?(userHasRole('ADMIN')?'ESPAÇOS DA EQUIPE':userHasRole('MEMBER')?'ESPAÇO DO MEMBRO':'EXPLORAR A STAR PARK'):'EXPLORAR A STAR PARK';\n  window.dispatchEvent(new Event('starpark:auth-change'));",
+              "exibir identidade e papéis combinados na navegação",
+          )
+          replace_once(
+              "public/app.js",
+              "async function loadSession(){try{const s=await api('/api/session');auth.user=s.user;auth.csrf=s.csrf;}catch{auth={user:null,csrf:null};}setIdentity();applyNavigation();}",
+              "async function loadSession(){try{const s=await api('/api/session');auth.user=s.user;auth.csrf=s.csrf;}catch{auth={user:null,csrf:null};}currentArea=userHasRole('ADMIN')?'admin':userHasRole('MEMBER')?'member':'public';setIdentity();applyNavigation();}",
+              "restaurar área padrão após atualizar a página",
+          )
+          replace_once(
+              "public/app.js",
+              "function applyNavigation(){const area=!auth.user?'public':auth.user.role==='MEMBER'?'member':'admin';currentArea=area;$$('.area-nav').forEach(n=>n.classList.toggle('active',n.id===`${area}Nav`));}",
+              "function applyNavigation(){if(!auth.user)currentArea='public';else if(currentArea==='admin'&&!userHasRole('ADMIN'))currentArea=userHasRole('MEMBER')?'member':'public';else if(currentArea==='member'&&!userHasRole('MEMBER'))currentArea=userHasRole('ADMIN')?'admin':'public';if(!['public','member','admin'].includes(currentArea))currentArea=userHasRole('ADMIN')?'admin':userHasRole('MEMBER')?'member':'public';$$('.area-nav').forEach(n=>n.classList.toggle('active',n.id===`${currentArea}Nav`));window.dispatchEvent(new Event('starpark:auth-change'));}\nfunction selectWorkspace(area){if(area==='member'&&!userHasRole('MEMBER'))return setPage('member-gate');if(area==='admin'&&!userHasRole('ADMIN'))return setPage('admin-gate');if(!['public','member','admin'].includes(area))return;currentArea=area;applyNavigation();if(area==='public')setPage('home');else if(area==='member'){setPage('member-home');loadMemberPortal();}else{setPage('admin-home');loadAdminData();}}\nwindow.starParkSelectWorkspace=selectWorkspace;window.starParkCurrentArea=()=>currentArea;",
+              "manter área pública e permitir alternância de espaços sem logout",
+          )
+          replace_once(
+              "public/app.js",
+              "$('#topAccessButton').addEventListener('click',()=>{if(!auth.user){setPage('access');return;}if(auth.user.role==='MEMBER'){setPage('member-home');loadMemberPortal();}else{setPage('admin-home');loadAdminData();}});",
+              "$('#topAccessButton').addEventListener('click',()=>{if(!auth.user){setPage('access');return;}selectWorkspace(userHasRole('ADMIN')?'admin':userHasRole('MEMBER')?'member':'public');});",
+              "abrir espaço padrão de acordo com as permissões reais",
+          )
+          replace_once(
+              "public/app.js",
+              "  if(expectedRole==='MEMBER'&&r.user.role!=='MEMBER')throw new Error('Esta conta não é de membro. Use o acesso administrativo.');\n  if(expectedRole==='ADMIN'&&r.user.role==='MEMBER')throw new Error('Esta conta é de membro. Use o portal dos membros.');\n  setIdentity();applyNavigation();form.reset();\n  if(auth.user.role==='MEMBER'){setPage('member-home');await loadMemberPortal();}else{setPage('admin-home');await loadAdminData();}",
+              "   if(expectedRole==='MEMBER'&&!userHasRole('MEMBER',r.user))throw new Error('Esta identidade não tem vínculo com um membro.');\n   if(expectedRole==='ADMIN'&&!userHasRole('ADMIN',r.user))throw new Error('Esta identidade não tem permissões administrativas.');\n   setIdentity();currentArea=expectedRole==='MEMBER'?'member':expectedRole==='ADMIN'?'admin':'public';applyNavigation();form.reset();\n   if(expectedRole==='MEMBER'){setPage('member-home');await loadMemberPortal();}else if(expectedRole==='ADMIN'){setPage('admin-home');await loadAdminData();}else setPage('home');",
+              "aceitar login da mesma identidade nas duas áreas",
+          )
+          replace_once(
+              "public/app.js",
+              " if(!auth.user||auth.user.role!=='MEMBER')return;",
+              "  if(!auth.user||!userHasRole('MEMBER'))return;",
+              "permitir portal de membro em conta administrativa vinculada",
+          )
+          replace_once(
+              "public/app.js",
+              "async function loadAdminData(){if(!auth.user||auth.user.role==='MEMBER')return;",
+              "async function loadAdminData(){if(!auth.user||!userHasRole('ADMIN'))return;",
+              "permitir central administrativa em conta de identidade combinada",
+          )
+          replace_once(
+              "public/app.js",
+              "$('#refreshAll').addEventListener('click',async()=>{await loadPublic();if(auth.user?.role==='MEMBER')await loadMemberPortal();else if(auth.user)await loadAdminData();toast('Dados atualizados.');});",
+              "$('#refreshAll').addEventListener('click',async()=>{await loadPublic();if(auth.user&&currentArea==='member'&&userHasRole('MEMBER'))await loadMemberPortal();else if(auth.user&&currentArea==='admin'&&userHasRole('ADMIN'))await loadAdminData();toast('Dados atualizados.');});",
+              "atualizar o espaço selecionado sem perder acesso combinado",
+          )
+          replace_once(
+              "public/app.js",
+              "   if(auth.user?.role==='MEMBER'&&currentPage.startsWith('member-'))await loadMemberPortal();",
+              "   if(userHasRole('MEMBER')&&currentPage.startsWith('member-'))await loadMemberPortal();",
+              "manter atualização automática de dados no espaço de membro combinado",
+          )
+          replace_once(
+              "public/app.js",
+              "async function init(){await loadSession();await loadPublic();if(auth.user?.role==='MEMBER'){applyNavigation();setPage('member-home');await loadMemberPortal();}else if(auth.user){applyNavigation();setPage('admin-home');await loadAdminData();}else{applyNavigation();setPage('home');}updateRecruitFormState();}",
+              "async function init(){await loadSession();await loadPublic();if(userHasRole('ADMIN')){currentArea='admin';applyNavigation();setPage('admin-home');await loadAdminData();}else if(userHasRole('MEMBER')){currentArea='member';applyNavigation();setPage('member-home');await loadMemberPortal();}else{applyNavigation();setPage('home');}updateRecruitFormState();}",
+              "inicializar área padrão em identidade com papéis combinados",
+          )
+
+          replace_once(
+              "public/app.js",
+              "function applyRoleVisibility(){const role=auth.user?.role;const owner=role==='OWNER';const moderator=role==='MODERATOR';$('#adminNav').querySelectorAll('.nav-item').forEach(item=>{const page=item.dataset.page;const ownerOnly=['admin-team'];const adminOnly=['admin-settings','admin-privacy','admin-api','admin-member-accounts'];item.style.display=(ownerOnly.includes(page)&&!owner)||(adminOnly.includes(page)&&moderator)?'none':'';});$('#staffForm').style.display=owner?'':'none';$('#staffList').style.display=owner?'':'none';if(role!=='OWNER'){$('#staffRole').innerHTML='<option value=\"MEMBER\">MEMBER</option>';$('#staffMemberLink').style.display='';}else $('#staffMemberLink').style.display=$('#staffRole').value==='MEMBER'?'':'none';}",
+              "function applyRoleVisibility(){const owner=userHasRole('OWNER');const moderator=userHasRole('MODERATOR');$('#adminNav').querySelectorAll('.nav-item').forEach(item=>{const page=item.dataset.page;const ownerOnly=['admin-team'];const adminOnly=['admin-settings','admin-privacy','admin-api','admin-member-accounts'];item.style.display=(ownerOnly.includes(page)&&!owner)||(adminOnly.includes(page)&&moderator)?'none':'';});$('#staffForm').style.display=owner?'':'none';$('#staffList').style.display=owner?'':'none';$('#staffMemberLink').style.display='';const memberSelect=$('#staffMemberSelect');if(memberSelect)memberSelect.required=$('#staffRole').value==='MEMBER';}",
+              "ajustar visibilidade e vínculo opcional de membro na criação de admin",
+          )
+          replace_once(
+              "public/app.js",
+              "$('#staffRole').addEventListener('change',()=>$('#staffMemberLink').style.display=$('#staffRole').value==='MEMBER'?'':'none');",
+              "$('#staffRole').addEventListener('change',()=>{const memberSelect=$('#staffMemberSelect');if(memberSelect)memberSelect.required=$('#staffRole').value==='MEMBER';$('#staffMemberLink').style.display='';});",
+              "permitir ADMIN opcionalmente associado a membro",
+          )
+          replace_once(
+              "public/app.js",
+              "const roleName=(role)=>",
+              "const roleName=(role)=>",
+              "preservar renderizador de nomes de papel",
+              expected=1,
+          ) if "const roleName=(role)=>" in read("public/app.js") else None
+
+          # Login via membro/administrador e funções extras usam os mesmos papéis.
+          replace_once(
+              "public/starpark-next.js",
+              "if (!auth?.user || auth.user.role === 'MEMBER' || adminQueueBusy) return;",
+              "if (!auth?.user || !window.starParkHasRole?.('ADMIN') || adminQueueBusy) return;",
+              "limitar fila WhatsApp a quem tem permissão administrativa",
+          )
+          replace_once(
+              "public/starpark-next.js",
+              "if (!auth?.user || auth.user.role !== 'MEMBER') return;",
+              "if (!auth?.user || !window.starParkHasRole?.('MEMBER')) return;",
+              "permitir extras do membro em conta combinada",
+          )
+
+          # ------------------------------------------------------------
+          # 8. Tag correction UI and staff identity link UI
+          # ------------------------------------------------------------
+          replace_once(
+              "public/app.js",
+              "if(a.status==='AWAITING_WHATSAPP')actions='<button class=\"mini-action primary\" data-confirm-whatsapp>CONFIRMAR ENTRADA E ATIVAR</button>';return `<article class=\"admin-row application-row\" data-id=\"${esc(a.id)}\"><span class=\"player-avatar\">${esc(initials(a.displayName))}</span>",
+              "if(a.status==='AWAITING_WHATSAPP')actions='<button class=\"mini-action primary\" data-confirm-whatsapp>CONFIRMAR ENTRADA E ATIVAR</button>';const representative=roster.find(item=>String(item.id)===String(a.desiredBrawlerId)||item.key===a.desiredBrawlerKey);const representativeImage=representative?.imageUrl||representative?.imageUrl2||representative?.imageUrl3||representative?.modelImageUrl;const avatar=representativeImage?`<img src=\"${esc(representativeImage)}\" alt=\"${esc(representative.name)}\" loading=\"lazy\">`:esc(initials(a.displayName));return `<article class=\"admin-row application-row\" data-id=\"${esc(a.id)}\"><span class=\"player-avatar application-avatar\">${avatar}</span>",
+              "mostrar imagem do Brawler representante na lista de candidaturas",
+          )
+          replace_once(
+              "public/app.js",
+              "<small>API: ${esc(a.apiLookupStatus)} · Troféus na candidatura: ${fmt(a.trophiesAtApplication)}${a.phone?` · Contato: ${esc(a.phone)}`:''}</small>",
+              "<small>API: ${esc(a.apiLookupStatus)} · Troféus: ${fmt(a.trophiesAtApplication)} · Clube: ${esc(a.clubAtApplication||'Não informado')}${a.phone?` · Contato: ${esc(a.phone)}`:''}</small>${a.playerStatsAtApplication?`<details class=\"application-api-details\"><summary>ESTATÍSTICAS DA API</summary><small>Vitórias 3v3: ${fmt(a.playerStatsAtApplication.victories3v3)} · Solo: ${fmt(a.playerStatsAtApplication.victoriesSolo)} · Duo: ${fmt(a.playerStatsAtApplication.victoriesDuo)} · Brawlers: ${fmt(a.playerStatsAtApplication.brawlerCount)} · Nível: ${fmt(a.playerStatsAtApplication.experienceLevel)}</small><small>Brawlers no perfil: ${(a.brawlersAtApplication||[]).slice(0,6).map(b=>`${esc(b.name)} (${fmt(b.trophies)})`).join(' · ')||'Não informado'}</small></details>`:''}",
+              "exibir estatísticas reais e detalhes de API sem expandir todos os cartões",
+          )
+
+          replace_once(
+              "public/app.js",
+              "${auth.user?.role==='OWNER'?`<button class=\"mini-action\" data-correct-baseline=\"${esc(m.id)}\">CORRIGIR BASELINE</button>`:''}",
+              "<button type=\"button\" class=\"mini-action\" data-correct-player-tag=\"${esc(m.id)}\">CORRIGIR TAG</button>${userHasRole('OWNER')?`<button type=\"button\" class=\"mini-action\" data-correct-baseline=\"${esc(m.id)}\">CORRIGIR BASELINE</button>`:''}",
+              "exibir fluxo de correção da tag aos administradores autorizados",
+          )
+          replace_once(
+              "public/app.js",
+              "}else if(b.hasAttribute('data-correct-baseline')){const value=prompt('Novo valor de baseline (troféus):');",
+              "}else if(b.hasAttribute('data-correct-player-tag')){const nextTag=prompt('Informe a nova tag do Brawl Stars (com ou sem #):');if(nextTag===null)return;const preview=await api(`/api/player/${encodeURIComponent(nextTag.replace(/^#/,'').replace(/\\s+/g,'').toUpperCase())}`);const found=preview.player||{};if(!found.name)throw new Error('A API não encontrou um jogador para esta tag.');const confirmed=prompt(`A API encontrou: ${found.name}. Digite o nickname exatamente como aparece no jogo para confirmar:`);if(confirmed===null)return;if(confirmed.trim().toLocaleLowerCase('pt-BR')!==String(found.name).trim().toLocaleLowerCase('pt-BR'))throw new Error('O nickname de confirmação não corresponde ao perfil encontrado.');const reason=prompt('Justificativa da correção (mínimo 5 caracteres):')||'';if(reason.trim().length<5)return toast('Informe uma justificativa com pelo menos 5 caracteres.');await api(`/api/admin/members/${b.dataset.correctPlayerTag}/player-tag`,{method:'POST',body:JSON.stringify({playerTag:nextTag,confirmNickname:confirmed,reason})});toast('Tag corrigida. O perfil foi sincronizado sem misturar o histórico da conta anterior.');}else if(b.hasAttribute('data-correct-baseline')){const value=prompt('Novo valor de baseline (troféus):');",
+              "conferir perfil encontrado antes de alterar tag",
+          )
+          replace_once(
+              "public/app.js",
+              "const roleName=(role)=>",
+              "const roleName=(role)=>",
+              "marcador de nome de papel mantido",
+              expected=1,
+          ) if "const roleName=(role)=>" in read("public/app.js") else None
+
+          # Mostra papéis combinados no inventário administrativo sem expor hashes/senhas.
+          replace_once(
+              "public/app.js",
+              "${esc(u.email)} · ${esc(roleName(u.role))}</small></div><span class=\"status-tag\">${esc(u.role)}</span>",
+              "${esc(u.email||u.username||'Sem e-mail')} · ${esc((u.roles||[u.role]).join(' + '))}${u.memberId?' · Membro vinculado':''}</small></div><span class=\"status-tag\">${esc((u.roles||[u.role]).join(' + '))}</span>",
+              "identificar conta de administrador e membro no painel de equipe",
+          )
+
+          # ------------------------------------------------------------
+          # 9. Recrutamento: remover checkbox e substituir formulário por confirmação
+          # ------------------------------------------------------------
+          replace_once(
+              "public/index.html",
+              '<label class="full-field toggle-row"><span><b>Quero solicitar uma conta de membro apos minha ativacao (opcional)</b><small>Isso nao cria a conta automaticamente. A administracao analisara o pedido depois de confirmar sua entrada.</small></span><input type="checkbox" name="wantsMemberAccount"></label>',
+              "",
+              "retirar solicitação de conta do formulário de recrutamento",
+          )
+          replace_once(
+              "public/index.html",
+              "<strong>Entre no WhatsApp</strong><p>O link aparece imediatamente apos o envio da candidatura.</p>",
+              "<strong>Entre no WhatsApp</strong><p>Depois do envio, use o botão destacado na confirmação para entrar no grupo enquanto aguarda a análise.</p>",
+              "atualizar instruções do recrutamento para a nova tela de confirmação",
+          )
+          replace_once(
+              "public/index.html",
+              "<strong>Aguarde a confirmacao</strong><p>A administracao confere sua entrada e ativa seu perfil de membro.</p>",
+              "<strong>Aguarde a análise</strong><p>A equipe avalia a candidatura e, se aprovada, confirma sua entrada no WhatsApp e ativa seu perfil.</p>",
+              "deixar a ordem aprovação e WhatsApp explícita para o candidato",
+          )
+          replace_once(
+              "public/index.html",
+              "<strong>Ative sua jornada</strong><p>Seu baseline é registrado no momento da ativação, para acompanhar sua evolução.</p>",
+              "<strong>Solicite seu acesso</strong><p>Depois da aprovação e ativação como membro, solicite sua conta separadamente. A administração ainda precisa aprovar o acesso.</p>",
+              "explicar a solicitação de conta independente da candidatura",
+          )
+          replace_once(
+              "public/index.html",
+              "Disponível para jogadores já cadastrados e ativos na Star Park. A senha fica protegida e só será ativada após aprovação da administração.",
+              "Disponível somente após candidatura aprovada e entrada confirmada pela equipe. O pedido continua separado do recrutamento e depende de aprovação administrativa.",
+              "explicar o requisito de candidatura aprovada no primeiro acesso",
+          )
+          replace_once(
+              "public/index.html",
+              "Vincular ao membro *<select name=\"memberId\" id=\"staffMemberSelect\">",
+              "Vincular ao membro (opcional para ADMIN; obrigatório para MEMBER)<select name=\"memberId\" id=\"staffMemberSelect\">",
+              "explicar vínculo opcional para conta administrativa combinada",
+          )
+          replace_once(
+              "public/app.js",
+              "const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;body.wantsMemberAccount=form.elements.wantsMemberAccount?.checked===true;",
+              "const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;",
+              "não enviar preferência de conta pelo formulário de recrutamento",
+          )
+          replace_once(
+              "public/app.js",
+              "form.reset();setFeedback('#applicationFeedback',`Candidatura recebida! Protocolo ${r.applicationId.slice(0,8).toUpperCase()}. A equipe fará a análise.`);toast('Candidatura enviada.');await loadPublic();",
+              "form.reset();setFeedback('#applicationFeedback',`Candidatura recebida! Protocolo ${r.applicationId.slice(0,8).toUpperCase()}. A equipe fará a análise.`);document.dispatchEvent(new CustomEvent('starpark:application-submitted',{detail:r}));toast('Candidatura enviada.');await loadPublic();",
+              "notificar tela de sucesso dedicada após o envio",
+          )
+          replace_once(
+              "public/starpark-next.js",
+              "${item.wantsMemberAccount ? '<span class=\"status-tag\">INTERESSE EM CONTA DE MEMBRO</span>' : ''}",
+              "",
+              "remover referência antiga ao checkbox da fila administrativa",
+          )
+          success_fn = r'''  function setupWhatsAppSuccess() {
+              const form = $('#applicationForm');
+              if (!form || form.dataset.spSuccessHandler) return;
+              form.dataset.spSuccessHandler = '1';
+              document.addEventListener('starpark:application-submitted', async event => {
+                const result = event.detail || {};
+                const layout = $('.recruit-layout');
+                if (!layout || $('#spApplicationConfirmation')) return;
+                const settings = await safeApi('/api/public/settings').catch(() => ({}));
+                const rawUrl = result.whatsappCommunityUrl || settings.whatsappCommunityUrl || WA_URL;
+                let safeUrl = WA_URL;
+                try { const parsed = new URL(rawUrl); if (parsed.protocol === 'https:' && parsed.hostname === 'chat.whatsapp.com') safeUrl = parsed.href; } catch {}
+                const box = document.createElement('section');
+                box.id = 'spApplicationConfirmation';
+                box.className = 'sp-application-confirmation';
+                const protocol = String(result.applicationId || '').slice(0, 8).toUpperCase() || 'REGISTRADO';
+                box.innerHTML = `<div class="sp-confirm-icon" aria-hidden="true">✓</div><span class="kicker">CANDIDATURA RECEBIDA</span><h2>Seu pedido chegou à Star Park!</h2><p class="sp-confirm-protocol">Protocolo <strong>${esc(protocol)}</strong></p><p>A equipe ainda fará a análise da sua candidatura. Entrar no WhatsApp não significa que a candidatura foi aprovada.</p><p>Entre na comunidade pelo botão abaixo enquanto aguarda a análise. Depois da aprovação, a equipe confirmará sua entrada e você poderá solicitar sua conta de membro pelo fluxo separado.</p>`;
+                const link = document.createElement('a');
+                link.className = 'sp-whatsapp-cta'; link.href = safeUrl; link.target = '_blank'; link.rel = 'noopener noreferrer';
+                link.textContent = 'ENTRAR NA COMUNIDADE DO WHATSAPP';
+                const foot = document.createElement('small'); foot.textContent = 'Guarde seu protocolo para consultar a candidatura com a administração.';
+                box.append(link, foot);
+                layout.replaceChildren(box);
+              });
+            }
+
+            function setupMemberQueue'''
+          replace_regex(
+              "public/starpark-next.js",
+              r"  function setupWhatsAppSuccess\(\) \{.*?\n  \}\n\n  function setupMemberQueue",
+              success_fn,
+              "trocar link escondido por tela de confirmação que substitui o formulário",
+              flags=re.S,
+          )
+
+          # ------------------------------------------------------------
+          # 10. Painel administrativo com gráficos reais e consolidação de login
+          # ------------------------------------------------------------
+          extra_js = r'''  function setupWorkspaceSwitch() {
+              const chip = $('.house-chip');
+              if (!chip) return;
+              let host = $('#spWorkspaceSwitch');
+              if (!host) { host = document.createElement('div'); host.id = 'spWorkspaceSwitch'; host.className = 'sp-workspace-switch'; chip.insertAdjacentElement('afterend', host); }
+              const render = () => {
+                const hasMember = Boolean(window.starParkHasRole?.('MEMBER'));
+                const hasAdmin = Boolean(window.starParkHasRole?.('ADMIN'));
+                const area = window.starParkCurrentArea?.() || 'public';
+                const buttons = [{id:'public',label:'PÚBLICO',symbol:'⌂'}];
+                if (hasMember) buttons.push({id:'member',label:'MEMBRO',symbol:'♟'});
+                if (hasAdmin) buttons.push({id:'admin',label:'ADMIN',symbol:'⚙'});
+                host.innerHTML = buttons.map(item => `<button type="button" class="sp-workspace-button ${area===item.id?'active':''}" data-sp-workspace="${item.id}" aria-pressed="${area===item.id}"><span>${item.symbol}</span>${item.label}</button>`).join('');
+              };
+              host.addEventListener('click', event => { const button = event.target.closest('[data-sp-workspace]'); if (!button) return; window.starParkSelectWorkspace?.(button.dataset.spWorkspace); render(); });
+              window.addEventListener('starpark:auth-change', render);
+              render();
+            }
+
+            function setupAdminAnalytics() {
+              const anchor = $('#adminOverview');
+              if (!anchor || anchor.dataset.spAnalytics === '1') return;
+              anchor.dataset.spAnalytics = '1';
+              const panel = document.createElement('section'); panel.id = 'spAdminAnalytics'; panel.className = 'sp-analytics-panel';
+              anchor.insertAdjacentElement('afterend', panel);
+              const chart = (title, note, rows) => {
+                const max = Math.max(1, ...rows.map(row => row.value));
+                const content = rows.length ? rows.map(row => `<div class="sp-chart-row"><span>${esc(row.label)}</span><div class="sp-chart-track"><i style="width:${Math.max(0,Math.min(100,row.value/max*100))}%"></i></div><b>${fmt(row.value)}</b></div>`).join('') : '<div class="sp-chart-empty">Ainda não há dados suficientes para este gráfico.</div>';
+                return `<article class="sp-chart-card"><h3>${esc(title)}</h3><p>${esc(note)}</p>${content}</article>`;
+              };
+              const render = () => {
+                if (!window.starParkHasRole?.('ADMIN')) { panel.hidden = true; return; }
+                panel.hidden = false;
+                const data = typeof admin === 'object' && admin ? admin : {};
+                const apps = Array.isArray(data.applications) ? data.applications : [];
+                const members = (Array.isArray(data.members) ? data.members : []).filter(member => member.status === 'ACTIVE');
+                const statuses = ['PENDING','IN_REVIEW','NEEDS_INFORMATION','APPROVED','AWAITING_WHATSAPP','ACTIVE','REJECTED','CANCELLED'];
+                const statusLabels = {PENDING:'Novas',IN_REVIEW:'Em análise',NEEDS_INFORMATION:'Com pendência',APPROVED:'Aprovadas',AWAITING_WHATSAPP:'WhatsApp',ACTIVE:'Ativadas',REJECTED:'Rejeitadas',CANCELLED:'Canceladas'};
+                const applicationRows = statuses.map(status => ({label:statusLabels[status],value:apps.filter(item=>item.status===status).length})).filter(row=>row.value>0);
+                const trophyGroups = [
+                  {label:'0–4.999',min:0,max:4999,value:0},{label:'5.000–9.999',min:5000,max:9999,value:0},
+                  {label:'10.000–19.999',min:10000,max:19999,value:0},{label:'20.000–29.999',min:20000,max:29999,value:0},
+                  {label:'30.000+',min:30000,max:Infinity,value:0}
+                ];
+                let knownTrophies=0;for(const member of members){const value=Number(member.currentTrophies);if(member.currentTrophies==null||!Number.isFinite(value))continue;knownTrophies++;const group=trophyGroups.find(item=>value>=item.min&&value<=item.max);if(group)group.value++;}
+                const syncRows = ['OK','PARTIAL','STALE','RATE_LIMITED','PENDING'].map(status=>({label:status==='OK'?'Atualizados':status==='PARTIAL'?'Parciais':status==='STALE'?'Desatualizados':status==='RATE_LIMITED'?'Limite da API':'Pendentes',value:members.filter(m=>(m.apiSyncStatus||'PENDING')===status).length})).filter(row=>row.value>0);
+                const brawlerCounts = new Map();for(const member of members){const name=member.representedBrawlerName||'Não informado';brawlerCounts.set(name,(brawlerCounts.get(name)||0)+1);}
+                const brawlerRows=[...brawlerCounts].map(([label,value])=>({label,value})).sort((a,b)=>b.value-a.value).slice(0,7);
+                panel.innerHTML = `<div class="sp-analytics-heading"><div><span class="kicker">DADOS DA OPERAÇÃO</span><h2>Indicadores da Star Park</h2></div><small>Calculados com os registros disponíveis agora; sem histórico ou números inventados.</small></div><div class="sp-analytics-grid">${chart('Fluxo de candidaturas','Distribuição por status atual.',applicationRows)}${chart('Faixas de troféus','Membros ativos com troféus conhecidos: '+knownTrophies+'.',trophyGroups.filter(row=>row.value>0))}${chart('Saúde da sincronização','Estado da última consulta oficial por membro ativo.',syncRows)}${chart('Brawlers representantes','Distribuição dos Brawlers escolhidos pelos membros ativos.',brawlerRows)}</div>`;
+              };
+              const observer = new MutationObserver(render); observer.observe(anchor,{childList:true,subtree:true,characterData:true});
+              window.addEventListener('starpark:auth-change',render); render();
+            }
+
+            function setupIdentityConsolidation() {
+              const staffList = $('#staffList'); if (!staffList || staffList.dataset.spIdentityLink === '1') return;
+              staffList.dataset.spIdentityLink = '1';
+              let panel = $('#spIdentityLinkPanel');
+              if (!panel) { panel=document.createElement('section');panel.id='spIdentityLinkPanel';panel.className='game-panel sp-identity-link-panel';staffList.insertAdjacentElement('afterend',panel); }
+              const render = () => {
+                if (!window.starParkHasRole?.('OWNER')) { panel.hidden=true; return; }
+                panel.hidden=false;
+                const data = typeof admin === 'object' && admin ? admin : {};
+                const users = (data.users||[]).filter(item=>['ADMIN','OWNER'].includes(item.role)&&!item.disabled&&!item.memberId);
+                const approvedIds = new Set((data.applications||[]).filter(item=>Array.isArray(item.history)&&item.history.some(entry=>entry.status==='APPROVED')).map(item=>item.id));
+                const members = (data.members||[]).filter(item=>item.status==='ACTIVE'&&approvedIds.has(item.applicationId));
+                const memberOptions = members.map(item=>`<option value="${esc(item.id)}">${esc(item.displayName)} · #${esc(item.playerTag)}</option>`).join('');
+                const userOptions = users.map(item=>`<option value="${esc(item.id)}">${esc(item.name)} · ${esc(item.role)} · ${esc(item.email||item.username||'')}</option>`).join('');
+                panel.innerHTML = `<div class="panel-head"><div><span class="kicker">IDENTIDADE ÚNICA</span><h3>Vincular administrador ao perfil de membro</h3></div></div><p>Consolida os dois espaços em um login. A conta administrativa escolhida mantém suas credenciais; a antiga conta MEMBER, quando selecionada, é desativada e preservada no histórico.</p><form id="spIdentityLinkForm" class="sp-identity-link-form"><label>Conta administrativa<select name="userId" required><option value="">Selecione</option>${userOptions}</select></label><label>Membro aprovado<select name="memberId" required><option value="">Selecione</option>${memberOptions}</select></label><label>Conta MEMBER antiga (opcional)<select name="mergeFromUserId"><option value="">Não consolidar outra conta</option></select></label><button type="submit" class="btn btn-yellow">VINCULAR IDENTIDADE</button><div id="spIdentityLinkFeedback" class="form-feedback" role="status"></div></form>${users.length&&members.length?'':'<div class="empty-box">Para vincular, é necessário haver uma conta administrativa sem perfil de membro e um membro ativo com candidatura aprovada.</div>'}`;
+                const form = $('#spIdentityLinkForm',panel); if(!form)return;
+                form.elements.memberId.addEventListener('change',()=>{
+                  const selected = form.elements.memberId.value;
+                  const linked = (data.users||[]).filter(item=>item.memberId===selected&&item.role==='MEMBER'&&!item.disabled);
+                  form.elements.mergeFromUserId.innerHTML = '<option value="">Não consolidar outra conta</option>'+linked.map(item=>`<option value="${esc(item.id)}">${esc(item.name)} · ${esc(item.email||item.username||'')}</option>`).join('');
+                });
+                form.addEventListener('submit',async event=>{
+                  event.preventDefault();const button=form.querySelector('button[type="submit"]');button.disabled=true;
+                  try{const body=Object.fromEntries(new FormData(form));await safeApi(`/api/admin/users/${encodeURIComponent(body.userId)}/link-member`,{method:'POST',body:JSON.stringify(body)});$('#spIdentityLinkFeedback').textContent='Identidade consolidada. O login administrativo agora também abre a área de membro.';if(typeof loadAdminData==='function')await loadAdminData();}
+                  catch(error){$('#spIdentityLinkFeedback').textContent=error.message||'Não foi possível vincular as identidades.';}
+                  finally{button.disabled=false;}
+                });
+              };
+              const observer = new MutationObserver(render); observer.observe(staffList,{childList:true,subtree:true});
+              window.addEventListener('starpark:auth-change',render); render();
+            }
+
+          '''
+          replace_once(
+              "public/starpark-next.js",
+              "  function init() {\n    setupTagPreview();",
+              extra_js + "  function init() {\n    setupWorkspaceSwitch();\n    setupAdminAnalytics();\n    setupIdentityConsolidation();\n    setupTagPreview();",
+              "adicionar troca de espaços, quatro gráficos reais e consolidação de identidade",
+          )
+
+          css_addition = '/* STAR PARK 6.0.0 — acessibilidade, espaços, gráficos e confirmação */\n.btn,.btn-block{min-height:48px;font-size:14px;line-height:1.25;padding:12px 18px;letter-spacing:.25px}\n.mini-action{min-height:40px;font-size:12px;line-height:1.2;padding:9px 12px;white-space:normal}\n.nav-item{min-height:46px;font-size:12px;padding-top:11px;padding-bottom:11px}\nbutton,select,input,textarea{touch-action:manipulation}\nbutton:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #f2b91e;outline-offset:3px}\n.sp-workspace-switch{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:12px 0 16px;padding:0 12px}\n.sp-workspace-button{min-width:0;min-height:42px;border:1px solid #c9d9e9;border-radius:10px;background:#f5f9fd;color:#20344c;font-size:10px;font-weight:900;letter-spacing:.35px;padding:8px 5px;cursor:pointer}\n.sp-workspace-button span{display:block;font-size:15px;margin-bottom:2px}\n.sp-workspace-button.active{background:#142e4b;color:#fff;border-color:#142e4b;box-shadow:0 2px 0 #0b1d32}\n.sp-application-confirmation{width:min(760px,100%);margin:0 auto;padding:clamp(22px,5vw,42px);border:2px solid #31a879;border-radius:22px;background:linear-gradient(150deg,#f2fff8,#fff);color:#17324a;text-align:center;box-shadow:0 12px 34px #12324a12}\n.sp-confirm-icon{display:grid;place-items:center;width:64px;height:64px;margin:0 auto 16px;border-radius:50%;background:#d9f8e9;color:#13865a;font-size:36px;font-weight:900}\n.sp-application-confirmation h2{margin:8px 0 14px;font-size:clamp(25px,4vw,36px);line-height:1.1}\n.sp-application-confirmation p{max-width:600px;margin:10px auto;color:#52697d;line-height:1.6}\n.sp-confirm-protocol{padding:10px;border-radius:10px;background:#edf5fb;color:#263f57}\n.sp-whatsapp-cta{display:flex;align-items:center;justify-content:center;min-height:58px;margin:22px auto 12px;padding:14px 20px;border:2px solid #087d4c;border-radius:13px;background:#20c66c;color:#063e28;font-size:15px;font-weight:1000;line-height:1.3;text-decoration:none;box-shadow:0 4px 0 #087d4c}\n.sp-whatsapp-cta:focus-visible{outline:3px solid #f2b91e;outline-offset:4px}\n.sp-application-confirmation>small{display:block;color:#688096;line-height:1.5}\n.sp-analytics-panel{margin:20px 0;padding:clamp(14px,3vw,22px);border:1px solid #d6e4ef;border-radius:18px;background:#f6faff;color:#18334e}\n.sp-analytics-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:14px}\n.sp-analytics-heading h2{margin:4px 0;font-size:clamp(20px,3vw,27px)}\n.sp-analytics-heading>small{max-width:330px;color:#6a8197;line-height:1.45}\n.sp-analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}\n.sp-chart-card{min-width:0;padding:16px;border:1px solid #dbe7f0;border-radius:14px;background:#fff}\n.sp-chart-card h3{margin:0 0 4px;font-size:15px}\n.sp-chart-card>p{margin:0 0 14px;color:#71869a;font-size:11px;line-height:1.45}\n.sp-chart-row{display:grid;grid-template-columns:minmax(70px,110px) minmax(40px,1fr) 28px;align-items:center;gap:8px;margin:9px 0;font-size:11px}\n.sp-chart-row>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#526b82}\n.sp-chart-track{height:10px;overflow:hidden;border-radius:20px;background:#e9f0f6}\n.sp-chart-track i{display:block;height:100%;min-width:0;border-radius:20px;background:linear-gradient(90deg,#1b8bd6,#32bb91)}\n.sp-chart-row>b{text-align:right;font-variant-numeric:tabular-nums}\n.sp-chart-empty{padding:18px 8px;border:1px dashed #ccdce8;border-radius:10px;color:#71869a;text-align:center;font-size:12px}\n.sp-identity-link-panel{margin-top:14px;padding:18px}\n.sp-identity-link-panel>p{max-width:720px;color:#647b91;line-height:1.55}\n.sp-identity-link-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end}\n.sp-identity-link-form label{display:grid;gap:6px;color:#3e566e;font-size:12px;font-weight:700}\n.sp-identity-link-form label:nth-child(3){grid-column:1/-1}\n.sp-identity-link-form button{grid-column:1/-1;justify-self:start}\n.sp-tag-preview{font-size:13px;line-height:1.45}\n.application-avatar img{width:100%;height:100%;object-fit:cover;border-radius:inherit}\n.application-api-details{margin-top:7px;padding:8px 10px;border-radius:9px;background:#f2f7fb;color:#3e566e}\n.application-api-details summary{font-size:10px;font-weight:900;cursor:pointer}\n.application-api-details small{display:block;margin-top:5px;line-height:1.5}\n@media(max-width:720px){.sp-analytics-grid{grid-template-columns:1fr}.sp-analytics-heading{align-items:flex-start;flex-direction:column}.sp-identity-link-form{grid-template-columns:1fr}.sp-identity-link-form label:nth-child(3),.sp-identity-link-form button{grid-column:auto}.sp-workspace-switch{padding:0 8px}.sp-workspace-button{font-size:9px}.sp-whatsapp-cta{font-size:13px}}'
+          replace_once(
+              "public/starpark-next.css",
+              "/* STAR PARK NEXT - estilos responsivos incrementais */",
+              "/* STAR PARK NEXT - estilos responsivos incrementais */\n" + css_addition,
+              "melhorar tamanhos de botões, mobile, gráficos e confirmação",
+          )
+
+          # ------------------------------------------------------------
+          # 11. Versão e documentação
+          # ------------------------------------------------------------
+          package = json.loads(read("package.json"))
+          if package.get("version") != "5.1.0":
+              raise SystemExit(f"Versão-base inesperada no package.json: {package.get('version')}")
+          package["version"] = "6.0.0"
+          write("package.json", json.dumps(package, ensure_ascii=False, indent=2) + "\n")
+          replace_once("server.mjs", "const APP_VERSION = '5.1.0';", "const APP_VERSION = '6.0.0';", "atualizar versão exibida no health check")
+          readme = read("README.md")
+          heading = "\n## STAR PARK 6.0.0 — Mega atualização integrada\n\n- Candidaturas novas começam em `PENDING`; a confirmação de WhatsApp exige aprovação administrativa registrada no histórico.\n- Solicitação e aprovação de conta de membro continuam em fluxo separado e exigem membro ativo vinculado a candidatura aprovada. Membros já ativados pelo fluxo anterior têm a aprovação histórica preservada na migração.\n- Identidades podem reunir permissões `ADMIN`/`OWNER` e `MEMBER`; uma conta administrativa pode ser vinculada a um perfil, preservando e desativando com auditoria a conta de membro antiga quando houver consolidação.\n- Correção de tag consulta novamente a API, exige confirmação do nickname retornado, arquiva o contexto anterior e reinicia as estatísticas para não misturar jogadores.\n- A confirmação de candidatura substitui o formulário por uma tela com protocolo e link do WhatsApp.\n- Indicadores administrativos usam dados atuais de candidaturas, troféus, sincronização e Brawlers; estados sem dados ficam vazios, sem valores fictícios.\n- Perfis de Brawlers preservam gadgets, poderes e equipamentos somente quando esses campos estão presentes na resposta oficial.\n- As áreas, eventos, anúncios, rankings, catálogo, sincronização, auditoria e recursos existentes são mantidos.\n"
+          if "## STAR PARK 6.0.0 — Mega atualização integrada" not in readme:
+              write("README.md", readme.rstrip() + "\n" + heading)
+          print("Atualização 6.0.0 aplicada ao código-fonte.")
+          PY
+          python3 /tmp/apply-starpark-6.py
+
+      - name: Validar sintaxe, HTML, CSS, versão e fluxo de segurança
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --check server.mjs
+          node --check public/app.js
+          node --check public/starpark-next.js
+          node --check lib/star-park-domain.mjs
+          node --check tests/auth.test.mjs
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import json
+
+          class CheckHTML(HTMLParser):
+              def error(self, message):
+                  raise RuntimeError(message)
+
+          for filename in ['public/index.html']:
+              parser=CheckHTML()
+              parser.feed(Path(filename).read_text(encoding='utf-8'))
+              parser.close()
+          for filename in ['public/styles.css','public/starpark-next.css']:
+              css=Path(filename).read_text(encoding='utf-8')
+              if css.count('{') != css.count('}'):
+                  raise SystemExit(f'CSS com chaves desbalanceadas: {filename}')
+          package=json.loads(Path('package.json').read_text(encoding='utf-8'))
+          if package.get('version')!='6.0.0':
+              raise SystemExit('package.json não está em 6.0.0')
+          server=Path('server.mjs').read_text(encoding='utf-8')
+          app=Path('public/app.js').read_text(encoding='utf-8')
+          html=Path('public/index.html').read_text(encoding='utf-8')
+          extra=Path('public/starpark-next.js').read_text(encoding='utf-8')
+          auth_test=Path('tests/auth.test.mjs').read_text(encoding='utf-8')
+          checks={
+            'candidatura inicia em PENDING': "motivation,status:'PENDING'" in server,
+            'ativação exige aprovação': "!applicationWasApproved(app)" in server,
+            'membros antigos ativos preservam elegibilidade': 'legacyActivatedApplications' in server,
+            'conta exige candidatura aprovada': 'memberAccountEligible(member,store.applications)' in server,
+            'checkbox removido do recrutamento': 'name="wantsMemberAccount"' not in html,
+            'formulário não envia preferência antiga': 'body.wantsMemberAccount' not in app,
+            'conta separada permanece': '/api/member/account-requests' in server and 'memberAccountRequestForm' in html,
+            'troca de espaços presente': 'starParkSelectWorkspace' in app and 'spWorkspaceSwitch' in extra,
+            'consolidação de conta presente': 'link-member' in server and 'spIdentityLinkForm' in extra,
+            'correção de tag presente': 'player-tag' in server and 'data-correct-player-tag' in app,
+            'gráficos administrativos presentes': 'spAdminAnalytics' in extra,
+            'dados reais da API preservados na candidatura': 'playerStatsAtApplication' in server and 'clubAtApplication' in server,
+            'candidato exibe Brawler e estatísticas': 'application-avatar' in app and 'application-api-details' in app,
+            'moderador mantém acesso administrativo': "roles.some(item=>['OWNER','MODERATOR'].includes(item))" in app,
+            'teste de integração percorre aprovação e WhatsApp': "for(const status of ['IN_REVIEW','APPROVED','AWAITING_WHATSAPP'])" in auth_test,
+            'tela de confirmação substitui formulário': 'spApplicationConfirmation' in extra,
+            'teste de regressão criado': Path('tests/star-park-domain.test.mjs').is_file(),
+          }
+          for label,ok in checks.items(): print(('OK ' if ok else 'FALHOU ')+label)
+          failed=[label for label,ok in checks.items() if not ok]
+          if failed: raise SystemExit('Falhas na validação: '+', '.join(failed))
+          print('Validação estrutural concluída.')
+          PY
+
+      - name: Instalar dependências e executar todos os testes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+          npm test
+
+      - name: Conferir diferenças e bloquear alterações inesperadas
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import json, subprocess
+          before=json.loads(subprocess.check_output(['git','show','HEAD:package.json'],text=True))
+          after=json.load(open('package.json',encoding='utf-8'))
+          before['version']='6.0.0'
+          if after!=before: raise SystemExit('package.json teve alterações além da versão.')
+          changed=set(subprocess.check_output(['git','status','--short'],text=True).splitlines())
+          allowed_prefixes=(' M README.md',' M server.mjs',' M public/',' M package.json','?? lib/star-park-domain.mjs','?? tests/star-park-domain.test.mjs',' M tests/auth.test.mjs')
+          unexpected=[line for line in changed if not line.startswith(allowed_prefixes)]
+          if unexpected: raise SystemExit('Arquivos inesperados modificados: '+repr(unexpected))
+          PY
+          git status --short
+          git diff --stat
+
+      - name: Instalar no GitHub somente após todos os testes passarem
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          git add package.json README.md server.mjs public/index.html public/app.js public/starpark-next.js public/starpark-next.css lib/star-park-domain.mjs tests/star-park-domain.test.mjs tests/auth.test.mjs
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteração para instalar."
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "feat(star-park): mega atualização integrada 6.0.0"
+          git push origin HEAD:main
+          echo "Versão 6.0.0 publicada na main após validação."
+
+      - name: Resumo da execução
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## STAR PARK 6.0.0 — Mega atualização integrada"
+            echo "- Resultado do job: ${{ job.status }}"
+            echo "- Candidaturas exigem aprovação registrada antes da ativação e do acesso de membro."
+            echo "- Solicitações de conta e sua fila administrativa foram preservadas."
+            echo "- Backup do código-fonte: artefato com retenção de 30 dias (quando a instalação foi necessária)."
+            echo "- O código só é enviado à main depois de node --check, validações estruturais e npm test."
+            echo "- O job não grava diretamente no Firestore. Na primeira inicialização da versão 6.0.0, o servidor executa uma migração idempotente de candidaturas antigas em lotes e registra auditoria."
+            echo "- O backup de 30 dias cobre o código-fonte, não os dados Firestore. Faça um backup do Firestore antes de executar a atualização."
+          } >> "$GITHUB_STEP_SUMMARY"
