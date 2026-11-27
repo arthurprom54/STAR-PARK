@@ -1,0 +1,338 @@
+name: STAR PARK 5.1.0 - Instalacao completa em arquivo unico
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/star-park-grande-atualizacao.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-park-5-1-0-single-installer
+  cancel-in-progress: false
+
+jobs:
+  install:
+    name: Preparar, validar e instalar STAR PARK 5.1.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Baixar a versao enviada para main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Verificar versao e workflow anterior
+        id: guard
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "Execute este instalador na branch main."
+            exit 1
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" = "5.1.0" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "STAR PARK 5.1.0 ja esta instalada. Nenhuma alteracao sera feita."
+            exit 0
+          fi
+          if [ "$VERSION" != "5.0.3" ]; then
+            echo "Versao inesperada: $VERSION. Esperado 5.0.3."
+            exit 1
+          fi
+          git show "${GITHUB_SHA}^:.github/workflows/star-park-grande-atualizacao.yml" > /tmp/starpark-workflow-anterior.yml
+          grep -q "cat > /tmp/apply-starpark-update.py <<'PY'" /tmp/starpark-workflow-anterior.yml
+          echo "already=false" >> "$GITHUB_OUTPUT"
+          echo "Base 5.0.3 confirmada. Instalador incorporado encontrado."
+
+      - name: Criar backup do codigo antes da alteracao
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for file in package.json README.md server.mjs public/index.html public/app.js public/styles.css lib/firestore-store.mjs; do
+            test -f "$file"
+          done
+          if git ls-files | grep -E '(^|/)(\\.env|serviceAccountKey\\.json|firebase-service-account[^/]*\\.json|.*\\.pem)$' >/tmp/starpark-sensitive-files.txt; then
+            echo "Foram encontrados arquivos sensiveis versionados. Backup interrompido."
+            cat /tmp/starpark-sensitive-files.txt
+            exit 1
+          fi
+          mkdir -p /tmp/starpark-source-backup
+          tar -czf /tmp/starpark-source-backup/star-park-source-before-5-1-0.tar.gz \
+            package.json README.md server.mjs public/index.html public/app.js public/styles.css \
+            lib tests scripts firestore.rules
+          sha256sum /tmp/starpark-source-backup/star-park-source-before-5-1-0.tar.gz
+
+      - name: Guardar backup do codigo-fonte
+        if: steps.guard.outputs.already != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: star-park-codigo-antes-da-5-1-0-${{ github.run_number }}
+          path: /tmp/starpark-source-backup/star-park-source-before-5-1-0.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Extrair o instalador incorporado neste unico workflow
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('/tmp/starpark-workflow-anterior.yml').read_text(encoding='utf-8').splitlines()
+          start_marker = "          cat > /tmp/apply-starpark-update.py <<'PY'"
+          start = source.index(start_marker) + 1
+          end = next((i for i in range(start, len(source)) if source[i] == "          PY"), None)
+          if end is None:
+              raise SystemExit("Nao encontrei o fim do instalador Python original.")
+          lines = []
+          for line in source[start:end]:
+              if line and not line.startswith("          "):
+                  raise SystemExit("Indentacao inesperada no instalador incorporado.")
+              lines.append(line[10:] if line else "")
+          code = "\n".join(lines) + "\n"
+          compile(code, "/tmp/apply-starpark-update.py", "exec")
+          Path("/tmp/apply-starpark-update.py").write_text(code, encoding="utf-8")
+          print(f"Instalador original extraido e validado: {len(lines)} linhas.")
+          PY
+          python3 /tmp/apply-starpark-update.py
+
+      - name: Aplicar correcoes finais em um unico passo
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > /tmp/finalize-starpark-5-1-0.py <<'PY'
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+
+          def patch(path, old, new, label):
+              file = ROOT / path
+              source = file.read_text(encoding="utf-8")
+              count = source.count(old)
+              if count == 0 and new in source:
+                  return
+              if count != 1:
+                  raise SystemExit(f"ABORTADO: {label}: esperava um marcador, encontrei {count}.")
+              file.write_text(source.replace(old, new, 1), encoding="utf-8", newline="\n")
+
+          # Preferencia opcional de conta de membro na candidatura.
+          patch(
+              "server.mjs",
+              "applicationTrophiesCapturedAt,submittedAt:nowISO()",
+              "applicationTrophiesCapturedAt,wantsMemberAccount:body.wantsMemberAccount===true,submittedAt:nowISO()",
+              "persistencia do interesse opcional por conta",
+          )
+          patch(
+              "public/app.js",
+              "const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;",
+              "const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;body.wantsMemberAccount=form.elements.wantsMemberAccount?.checked===true;",
+              "envio do interesse opcional",
+          )
+          patch(
+              "public/index.html",
+              '<label class="consent-row"><input type="checkbox" name="privacyAcknowledged" required>',
+              '<label class="full-field toggle-row"><span><b>Quero solicitar uma conta de membro apos minha ativacao (opcional)</b><small>Isso nao cria a conta automaticamente. A administracao analisara o pedido depois de confirmar sua entrada.</small></span><input type="checkbox" name="wantsMemberAccount"></label><label class="consent-row"><input type="checkbox" name="privacyAcknowledged" required>',
+              "checkbox opcional no formulario",
+          )
+          old_queue = r'''<small>#${esc(item.playerTag)} · ${esc(item.desiredBrawlerName || 'Brawler nao informado')} · Enviada: ${esc(date(item.submittedAt))}</small><span class="status-tag warn">AGUARDANDO WHATSAPP</span>'''
+          new_queue = r'''<small>#${esc(item.playerTag)} · ${esc(item.desiredBrawlerName || 'Brawler nao informado')} · Enviada: ${esc(date(item.submittedAt))}</small>${item.wantsMemberAccount ? '<span class="status-tag">INTERESSE EM CONTA DE MEMBRO</span>' : ''}<span class="status-tag warn">AGUARDANDO WHATSAPP</span>'''
+          patch(
+              "public/starpark-next.js",
+              old_queue,
+              new_queue,
+              "sinalizacao do interesse em conta na fila administrativa",
+          )
+          patch(
+              "public/starpark-next.js",
+              '<button class="mini-action danger" data-sp-close-goal="${esc(g.id)}">ENCERRAR</button>',
+              '<button type="button" class="mini-action danger" data-sp-close-goal="${esc(g.id)}">ENCERRAR</button>',
+              "botao de encerrar meta nao pode submeter formulario",
+          )
+
+          # Migracao segura dos papeis legados: OWNER permanece exclusivo.
+          patch(
+              "server.mjs",
+              "const roles = new Set(['OWNER','ADMIN','MODERATOR','MEMBER']);",
+              "const roles = new Set(['OWNER','ADMIN','MEMBER']);",
+              "remocao de MODERATOR dos novos papeis",
+          )
+          legacy_code = (
+              "  const legacyModerators=store.users.filter(u=>u.role==='MODERATOR');\n"
+              "  if(legacyModerators.length){\n"
+              "    await mutate(()=>{for(const account of store.users){if(account.role==='MODERATOR'){account.role='ADMIN';account.permissions=defaultPermissions('ADMIN');account.roleMigratedAt=nowISO();audit(null,'Papel legado convertido para ADMIN',account.name||account.email||account.id);}}});\n"
+              "    console.info(`[STAR PARK] ${legacyModerators.length} conta(s) MODERATOR convertida(s) para ADMIN.`);\n"
+              "  }\n"
+              "  if(OWNER_EMAIL&&OWNER_PASSWORD){"
+          )
+          patch(
+              "server.mjs",
+              "  if(OWNER_EMAIL&&OWNER_PASSWORD){",
+              legacy_code,
+              "migracao auditada de MODERATOR para ADMIN",
+          )
+
+          # O endpoint do proprio membro devolve seus campos privados mesmo com perfil publico desativado.
+          patch(
+              "server.mjs",
+              "{...publicMember(member),gameNickname:member.gameNickname",
+              "{...publicMember(member),profileTitle:member.profileTitle||'',bio:member.bio||'',avatar:member.avatar||null,profileTheme:member.profileTheme||'blue',gameNickname:member.gameNickname",
+              "retorno dos campos privados do proprio perfil",
+          )
+
+          # A senha administrativa permanece forte (12 caracteres); somente a solicitacao pessoal de conta aceita 6.
+          patch(
+              "server.mjs",
+              "password.length<6||password.length>128||!['MEMBER','ADMIN'].includes(role)",
+              "password.length<12||password.length>128||!['MEMBER','ADMIN'].includes(role)",
+              "regra de senha para contas criadas pela administracao",
+          )
+          patch(
+              "server.mjs",
+              "Dados invalidos. Usuario de 3 a 24 caracteres e senha minima de 6; OWNER",
+              "Dados invalidos. Usuario de 3 a 24 caracteres e senha minima de 12; OWNER",
+              "mensagem da regra de senha administrativa",
+          )
+          patch(
+              "public/index.html",
+              'name="password" type="password" required minlength="6" maxlength="128" autocomplete="new-password"',
+              'name="password" type="password" required minlength="12" maxlength="128" autocomplete="new-password"',
+              "minimo de senha no formulario de equipe",
+          )
+
+          # Link da comunidade usa o valor configurado no servidor, com fallback existente.
+          patch(
+              "public/starpark-next.js",
+              "const observer = new MutationObserver(() => {",
+              "const observer = new MutationObserver(async () => {",
+              "callback assincrono do link WhatsApp",
+          )
+          patch(
+              "public/starpark-next.js",
+              "const link = document.createElement('a'); link.href = WA_URL;",
+              "const link = document.createElement('a'); const community = await safeApi('/api/public/settings').catch(() => ({})); link.href = community.whatsappCommunityUrl || WA_URL;",
+              "link WhatsApp configuravel",
+          )
+
+          # Validacao final dos itens que nao podem faltar na versao 5.1.0.
+          server = (ROOT / "server.mjs").read_text(encoding="utf-8")
+          app = (ROOT / "public/app.js").read_text(encoding="utf-8")
+          html = (ROOT / "public/index.html").read_text(encoding="utf-8")
+          next_js = (ROOT / "public/starpark-next.js").read_text(encoding="utf-8")
+          checks = {
+              "status AWAITING_WHATSAPP": "status:'AWAITING_WHATSAPP'" in server,
+              "interesse opcional persistido": "wantsMemberAccount:body.wantsMemberAccount===true" in server,
+              "checkbox opcional": 'name="wantsMemberAccount"' in html,
+              "interesse visivel na fila": "INTERESSE EM CONTA DE MEMBRO" in next_js,
+              "migracao de MODERATOR": "legacyModerators" in server,
+              "senha de equipe forte": "password.length<12||password.length>128||!['MEMBER','ADMIN'].includes(role)" in server,
+              "preview de perfil Brawl Stars": "Previa do perfil Brawl Stars" in next_js,
+              "link da comunidade": "whatsappCommunityUrl" in server and "community.whatsappCommunityUrl" in next_js,
+              "cancelamento de inscricao": "event-registration/cancel" in server,
+              "metas coletivas": "/api/public/goals" in server,
+              "dados do perfil privado": "profileTitle:member.profileTitle" in server,
+              "botao de meta sem submissao acidental": 'type="button" class="mini-action danger" data-sp-close-goal' in next_js,
+              "envio da preferencia pelo frontend": "body.wantsMemberAccount=form.elements.wantsMemberAccount?.checked===true" in app,
+          }
+          failed = [label for label, ok in checks.items() if not ok]
+          for label, ok in checks.items():
+              print(("OK " if ok else "FALHOU ") + label)
+          if failed:
+              raise SystemExit("Validacao final falhou: " + ", ".join(failed))
+          print("Correcoes finais concluidas.")
+          PY
+          python3 /tmp/finalize-starpark-5-1-0.py
+
+      - name: Validar sintaxe e testes do projeto
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --check server.mjs
+          node --check public/app.js
+          node --check public/starpark-next.js
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import json
+          class CheckHTML(HTMLParser):
+              def error(self, message): raise RuntimeError(message)
+          parser=CheckHTML()
+          parser.feed(Path('public/index.html').read_text(encoding='utf-8'))
+          parser.close()
+          css=Path('public/starpark-next.css').read_text(encoding='utf-8')
+          if css.count('{') != css.count('}'):
+              raise SystemExit('CSS com chaves desbalanceadas.')
+          package=json.loads(Path('package.json').read_text(encoding='utf-8'))
+          if package.get('version') != '5.1.0':
+              raise SystemExit('package.json nao esta na versao 5.1.0.')
+          for path in ['public/starpark-next.js','public/starpark-next.css']:
+              if not Path(path).is_file(): raise SystemExit(f'Asset ausente: {path}')
+          print('HTML, CSS, package.json e assets validados.')
+          PY
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+          npm test
+
+      - name: Conferir diff e instalar somente se todos os testes passaram
+        if: steps.guard.outputs.already != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import json, subprocess
+          before=json.loads(subprocess.check_output(['git','show','HEAD:package.json'],text=True))
+          after=json.load(open('package.json',encoding='utf-8'))
+          if after.get('version')!='5.1.0':
+              raise SystemExit('Versao final diferente de 5.1.0.')
+          before['version']=after.get('version')
+          if before!=after:
+              raise SystemExit('package.json sofreu alteracoes alem da versao.')
+          PY
+          git add package.json README.md server.mjs public/index.html public/app.js public/styles.css public/starpark-next.js public/starpark-next.css
+          git add -u lib/firestore-store.mjs
+          if [ -f .github/workflows/prepare-star-park-5-1.yml ]; then
+            git rm -f .github/workflows/prepare-star-park-5-1.yml
+          fi
+          if [ -f tooling/patch-5-1-0-workflow.py ]; then
+            git rm -f tooling/patch-5-1-0-workflow.py
+          fi
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteracao para instalar."
+            exit 1
+          fi
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "feat(star-park): instalar versao completa 5.1.0"
+          git push origin HEAD:main
+          echo "STAR PARK 5.1.0 instalada na main depois das validacoes."
+
+      - name: Resumo final
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## STAR PARK 5.1.0"
+            echo "- Resultado do job: ${{ job.status }}"
+            echo "- Instalacao na main: somente apos testes bem-sucedidos."
+            echo "- Nenhuma migracao ou gravacao direta no Firestore foi executada."
+            echo "- Backup do codigo-fonte anexado a esta execucao por 14 dias."
+            echo "- Este workflow e o unico arquivo de instalacao; os dois auxiliares sao removidos apos sucesso."
+          } >> "$GITHUB_STEP_SUMMARY"
