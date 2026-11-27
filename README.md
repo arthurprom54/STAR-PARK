@@ -214,3 +214,14 @@ Consulte [`docs/publicar.md`](docs/publicar.md) para o passo a passo de publica�
 ## Notas da versão 5.0.2
 
 Consulte [docs/alteracoes-v5-0-2.md](docs/alteracoes-v5-0-2.md) para as correções, verificações e limites conhecidos desta versão.
+
+## STAR PARK 6.0.0 — Mega atualização integrada
+
+- Candidaturas novas começam em `PENDING`; a confirmação de WhatsApp exige aprovação administrativa registrada no histórico.
+- Solicitação e aprovação de conta de membro continuam em fluxo separado e exigem membro ativo vinculado a candidatura aprovada. Membros já ativados pelo fluxo anterior têm a aprovação histórica preservada na migração.
+- Identidades podem reunir permissões `ADMIN`/`OWNER` e `MEMBER`; uma conta administrativa pode ser vinculada a um perfil, preservando e desativando com auditoria a conta de membro antiga quando houver consolidação.
+- Correção de tag consulta novamente a API, exige confirmação do nickname retornado, arquiva o contexto anterior e reinicia as estatísticas para não misturar jogadores.
+- A confirmação de candidatura substitui o formulário por uma tela com protocolo e link do WhatsApp.
+- Indicadores administrativos usam dados atuais de candidaturas, troféus, sincronização e Brawlers; estados sem dados ficam vazios, sem valores fictícios.
+- Perfis de Brawlers preservam gadgets, poderes e equipamentos somente quando esses campos estão presentes na resposta oficial.
+- As áreas, eventos, anúncios, rankings, catálogo, sincronização, auditoria e recursos existentes são mantidos.
