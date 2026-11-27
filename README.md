@@ -1,4 +1,4 @@
-# STAR PARK 5.0.2 — A arena é nossa!
+# STAR PARK 5.1.0 — A arena é nossa!
 
 Plataforma comunitária independente para organizar a House STAR PARK de Brawl Stars. Não é produto oficial, não possui vínculo, patrocínio nem aprovação da Supercell.
 
