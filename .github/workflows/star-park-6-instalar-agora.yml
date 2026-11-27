@@ -1,0 +1,311 @@
+name: STAR PARK 6.0.0 — Instalação validada
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-park-6-instalar-validado
+  cancel-in-progress: false
+
+jobs:
+  instalar:
+    name: Backup, atualização, validação e publicação
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Baixar a branch principal
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Conferir versão-base e arquivos necessários
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "5.1.0" ]; then
+            echo "Versão-base inesperada: $VERSION. Este instalador foi preparado para a base 5.1.0."
+            exit 1
+          fi
+          required_files=(
+            package.json README.md server.mjs public/index.html public/app.js
+            public/styles.css public/starpark-next.js public/starpark-next.css
+            lib/firestore-store.mjs '.github/workflows/star-park-6-mega-atualizacao(1).yml'
+          )
+          for file in "${required_files[@]}"; do
+            test -f "$file" || { echo "Arquivo essencial ausente: $file"; exit 1; }
+          done
+          echo "Versão-base 5.1.0 confirmada."
+
+      - name: Criar backup do código antes de alterar
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if git ls-files | grep -E '(^|/)(\.env|serviceAccountKey\.json|firebase-service-account[^/]*\.json|.*\.pem)$' > /tmp/starpark-sensitive.txt; then
+            echo "Foram encontrados arquivos sensíveis versionados. Backup interrompido por segurança."
+            cat /tmp/starpark-sensitive.txt
+            exit 1
+          fi
+          mkdir -p /tmp/starpark-backup
+          tar -czf /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz \
+            package.json README.md server.mjs public lib tests scripts firestore.rules docs .github/workflows
+          sha256sum /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz
+
+      - name: Guardar backup para recuperação
+        uses: actions/upload-artifact@v4
+        with:
+          name: star-park-backup-antes-da-6.0.0-${{ github.run_number }}
+          path: /tmp/starpark-backup/star-park-source-before-6.0.0.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Aplicar a atualização 6.0.0 com correções do instalador
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          workflow_path = Path(".github/workflows/star-park-6-mega-atualizacao(1).yml")
+          workflow_text = workflow_path.read_text(encoding="utf-8")
+
+          open_marker = "          cat > /tmp/apply-starpark-6.py <<'PY'\n"
+          close_marker = "\n          PY\n          python3 /tmp/apply-starpark-6.py"
+          start = workflow_text.find(open_marker)
+          if start < 0:
+              raise SystemExit("Não encontrei o bloco original de atualização 6.0.0.")
+          start += len(open_marker)
+          end = workflow_text.find(close_marker, start)
+          if end < 0:
+              raise SystemExit("O bloco Python original da atualização está incompleto.")
+
+          raw_script = workflow_text[start:end]
+          script_lines = raw_script.splitlines()
+          if not script_lines or any(line and not line.startswith("          ") for line in script_lines):
+              raise SystemExit("A indentação do bloco original não corresponde ao formato esperado.")
+          script = "\n".join(line[10:] if line else "" for line in script_lines) + "\n"
+
+          def replace_function(source, pattern, replacement, label):
+              updated, count = re.subn(pattern, lambda _m: replacement, source, count=1)
+              if count != 1:
+                  raise SystemExit(f"Não foi possível corrigir exatamente uma função: {label} (encontradas: {count}).")
+              return updated
+
+          fixed_replace_once = '''def replace_once(path, old, new, label, expected=1):
+              source = read(path)
+              count = source.count(old)
+              if count == 0:
+                  if not new or new in source:
+                      print(f"OK já aplicado: {label}")
+                      return
+                  raise SystemExit(f"ABORTADO — {label}: marcador antigo e novo ausentes em {path}.")
+              if count != expected:
+                  raise SystemExit(f"ABORTADO — {label}: esperado(s) {expected}, encontrado(s) {count} em {path}.")
+              write(path, source.replace(old, new, expected))
+              print(f"OK aplicado: {label}")
+
+          '''
+          fixed_replace_line = '''def replace_line(path, prefix, replacement, label):
+              source = read(path)
+              lines = source.splitlines()
+              matches = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+              if len(matches) == 0:
+                  replacement_lines = replacement.splitlines()
+                  already_applied = any(
+                      lines[i:i + len(replacement_lines)] == replacement_lines
+                      for i in range(max(0, len(lines) - len(replacement_lines) + 1))
+                  )
+                  if already_applied:
+                      print(f"OK já aplicado: {label}")
+                      return
+                  raise SystemExit(f"ABORTADO — {label}: marcador de linha antigo e novo ausentes em {path}.")
+              if len(matches) != 1:
+                  raise SystemExit(f"ABORTADO — {label}: marcador de linha encontrado {len(matches)} vez(es) em {path}.")
+              lines[matches[0]:matches[0] + 1] = replacement.splitlines()
+              write(path, "\\n".join(lines) + "\\n")
+              print(f"OK aplicado: {label}")
+
+          '''
+          fixed_replace_regex = '''def replace_regex(path, pattern, replacement, label, flags=0):
+              source = read(path)
+              compiled = re.compile(pattern, flags)
+              if not compiled.search(source):
+                  if replacement and replacement in source:
+                      print(f"OK já aplicado: {label}")
+                      return
+                  raise SystemExit(f"ABORTADO — {label}: marcador antigo e novo ausentes em {path}.")
+              updated, count = compiled.subn(lambda _m: replacement, source, count=1)
+              if count != 1:
+                  raise SystemExit(f"ABORTADO — {label}: padrão encontrado {count} vez(es) em {path}.")
+              write(path, updated)
+              print(f"OK aplicado: {label}")
+
+          '''
+
+          script = replace_function(
+              script,
+              r"(?ms)^def replace_once\(path, old, new, label, expected=1\):\n.*?(?=^def replace_line\()",
+              fixed_replace_once,
+              "replace_once",
+          )
+          script = replace_function(
+              script,
+              r"(?ms)^def replace_line\(path, prefix, replacement, label\):\n.*?(?=^def replace_regex\()",
+              fixed_replace_line,
+              "replace_line",
+          )
+          script = replace_function(
+              script,
+              r"(?ms)^def replace_regex\(path, pattern, replacement, label, flags=0\):\n.*?(?=^# -{10,})",
+              fixed_replace_regex,
+              "replace_regex",
+          )
+
+          for signature in (
+              "def replace_once(path, old, new, label, expected=1):",
+              "def replace_line(path, prefix, replacement, label):",
+              "def replace_regex(path, pattern, replacement, label, flags=0):",
+          ):
+              if script.count(signature) != 1:
+                  raise SystemExit(f"Validação do patcher falhou: {signature}")
+
+          compile(script, "apply-starpark-6.py", "exec")
+          Path("/tmp/apply-starpark-6.py").write_text(script, encoding="utf-8")
+          subprocess.run([sys.executable, "/tmp/apply-starpark-6.py"], check=True)
+
+          test_file = Path("tests/auth.test.mjs")
+          test_source = test_file.read_text(encoding="utf-8")
+          old_env = "STAR_PARK_SESSION_SECRET:crypto.randomBytes(48).toString('hex')"
+          new_env = old_env + ",STAR_PARK_RECRUITMENT_OPEN_ON_BOOT:'true'"
+          if test_source.count(old_env) == 1:
+              test_source = test_source.replace(old_env, new_env, 1)
+              test_file.write_text(test_source, encoding="utf-8")
+              print("OK teste de integração inicia com recrutamento aberto no ambiente isolado.")
+          elif new_env in test_source:
+              print("OK configuração de teste de recrutamento já aplicada.")
+          else:
+              raise SystemExit("Não consegui preparar o ambiente isolado do teste de recrutamento.")
+
+          app = Path("public/app.js").read_text(encoding="utf-8")
+          if "body.wantsMemberAccount" in app:
+              raise SystemExit("A referência antiga wantsMemberAccount permaneceu no formulário.")
+          if 'name="wantsMemberAccount"' in Path("public/index.html").read_text(encoding="utf-8"):
+              raise SystemExit("O checkbox antigo permaneceu no formulário HTML.")
+          print("Patcher original executado com helpers corrigidos; formulário antigo removido.")
+          PY
+
+      - name: Validar sintaxe, HTML, CSS, versão e fluxo de segurança
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = Path(".github/workflows/star-park-6-mega-atualizacao(1).yml").read_text(encoding="utf-8")
+          lines = source.splitlines()
+          step_name = "Validar sintaxe, HTML, CSS, versão e fluxo de segurança"
+          marker = f"      - name: {step_name}"
+          try:
+              step_index = lines.index(marker)
+              run_index = next(i for i in range(step_index, len(lines)) if lines[i] == "        run: |")
+              end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].startswith("      - name: "))
+          except (ValueError, StopIteration):
+              raise SystemExit("Não encontrei o bloco de validação original.")
+          body = []
+          for line in lines[run_index + 1:end_index]:
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit("Indentação inesperada no bloco de validação original.")
+          command = "\n".join(body) + "\n"
+          subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command], check=True)
+          PY
+      - name: Instalar dependências e executar todos os testes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+          npm test
+
+      - name: Conferir alterações permitidas
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = Path(".github/workflows/star-park-6-mega-atualizacao(1).yml").read_text(encoding="utf-8")
+          lines = source.splitlines()
+          step_name = "Conferir diferenças e bloquear alterações inesperadas"
+          marker = f"      - name: {step_name}"
+          try:
+              step_index = lines.index(marker)
+              run_index = next(i for i in range(step_index, len(lines)) if lines[i] == "        run: |")
+              end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].startswith("      - name: "))
+          except (ValueError, StopIteration):
+              raise SystemExit("Não encontrei a conferência de diferenças original.")
+          body = []
+          for line in lines[run_index + 1:end_index]:
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit("Indentação inesperada na conferência de diferenças.")
+          subprocess.run(["bash", "-e", "-o", "pipefail", "-c", "\n".join(body) + "\n"], check=True)
+          PY
+      - name: Publicar somente o código da aplicação
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = Path(".github/workflows/star-park-6-mega-atualizacao(1).yml").read_text(encoding="utf-8")
+          lines = source.splitlines()
+          step_name = "Instalar no GitHub somente após todos os testes passarem"
+          marker = f"      - name: {step_name}"
+          try:
+              step_index = lines.index(marker)
+              run_index = next(i for i in range(step_index, len(lines)) if lines[i] == "        run: |")
+              end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].startswith("      - name: "))
+          except (ValueError, StopIteration):
+              raise SystemExit("Não encontrei o bloco de publicação original.")
+          body = []
+          for line in lines[run_index + 1:end_index]:
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit("Indentação inesperada no bloco de publicação.")
+          subprocess.run(["bash", "-e", "-o", "pipefail", "-c", "\n".join(body) + "\n"], check=True)
+          PY
+      - name: Resumo
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## STAR PARK 6.0.0 — Instalação validada"
+            echo "- Backup do código-fonte salvo como artefato."
+            echo "- Patches executados a partir do instalador original com substituições corrigidas."
+            echo "- Testes e validações devem passar antes do commit."
+            echo "- Este workflow não modifica arquivos em .github/workflows."
+            echo "- Faça backup do Firestore separadamente: o artefato contém código-fonte, não os dados do banco."
+          } >> "$GITHUB_STEP_SUMMARY"
