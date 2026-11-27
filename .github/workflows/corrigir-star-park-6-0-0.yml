@@ -1,0 +1,141 @@
+name: Corrigir workflow STAR PARK 6.0.0
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: corrigir-star-park-6-0-0
+  cancel-in-progress: false
+
+jobs:
+  corrigir:
+    name: Corrigir e validar o instalador 6.0.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Baixar a branch principal
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Corrigir a lógica de substituição do workflow original
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TARGET='.github/workflows/star-park-6-mega-atualizacao(1).yml'
+          test -f "$TARGET" || { echo "Workflow original não encontrado: $TARGET"; exit 1; }
+
+          python3 - "$TARGET" <<'PY'
+          from pathlib import Path
+          import sys
+
+          target = Path(sys.argv[1])
+          source = target.read_text(encoding='utf-8')
+
+          old_once = '''          def replace_once(path, old, new, label, expected=1):
+              source = read(path)
+              if new and new in source:
+                  print(f"OK já aplicado: {label}")
+                  return
+              count = source.count(old)
+              if count != expected:
+                  raise SystemExit(f"ABORTADO — {label}: esperado(s) {expected} marcador(es), encontrado(s) {count} em {path}.")
+              write(path, source.replace(old, new, expected))
+              print(f"OK aplicado: {label}")'''
+
+          new_once = '''          def replace_once(path, old, new, label, expected=1):
+              source = read(path)
+              count = source.count(old)
+              if count == 0:
+                  # Uma remoção concluída é idempotente. Uma substituição só é
+                  # considerada concluída quando o marcador antigo não existe mais.
+                  if not new or new in source:
+                      print(f"OK já aplicado: {label}")
+                      return
+                  raise SystemExit(f"ABORTADO — {label}: marcador antigo não encontrado e novo marcador ausente em {path}.")
+              if count != expected:
+                  raise SystemExit(f"ABORTADO — {label}: esperado(s) {expected} marcador(es), encontrado(s) {count} em {path}.")
+              write(path, source.replace(old, new, expected))
+              print(f"OK aplicado: {label}")'''
+
+          old_regex = '''          def replace_regex(path, pattern, replacement, label, flags=0):
+              source = read(path)
+              if replacement in source:
+                  print(f"OK já aplicado: {label}")
+                  return
+              updated, count = re.subn(pattern, lambda _m: replacement, source, count=1, flags=flags)
+              if count != 1:
+                  raise SystemExit(f"ABORTADO — {label}: padrão encontrado {count} vez(es) em {path}.")
+              write(path, updated)
+              print(f"OK aplicado: {label}")'''
+
+          new_regex = '''          def replace_regex(path, pattern, replacement, label, flags=0):
+              source = read(path)
+              compiled = re.compile(pattern, flags)
+              if not compiled.search(source):
+                  if replacement in source:
+                      print(f"OK já aplicado: {label}")
+                      return
+                  raise SystemExit(f"ABORTADO — {label}: marcador antigo não encontrado e novo marcador ausente em {path}.")
+              updated, count = compiled.subn(lambda _m: replacement, source, count=1)
+              if count != 1:
+                  raise SystemExit(f"ABORTADO — {label}: padrão encontrado {count} vez(es) em {path}.")
+              write(path, updated)
+              print(f"OK aplicado: {label}")'''
+
+          if source.count(old_once) != 1:
+              raise SystemExit('Esperava encontrar exatamente uma versão da função replace_once antiga. Nada foi alterado.')
+          if source.count(old_regex) != 1:
+              raise SystemExit('Esperava encontrar exatamente uma versão da função replace_regex antiga. Nada foi alterado.')
+          if 'body.wantsMemberAccount=form.elements.wantsMemberAccount?.checked===true;' not in source:
+              raise SystemExit('A substituição do campo antigo no formulário não foi encontrada; nada foi alterado.')
+          if "'formulário não envia preferência antiga': 'body.wantsMemberAccount' not in app" not in source:
+              raise SystemExit('A validação de regressão esperada não foi encontrada; nada foi alterado.')
+
+          fixed = source.replace(old_once, new_once, 1).replace(old_regex, new_regex, 1)
+          if old_once in fixed or old_regex in fixed:
+              raise SystemExit('A correção não substituiu integralmente as duas funções.')
+          if fixed.count('def replace_once(path, old, new, label, expected=1):') != 1:
+              raise SystemExit('A função replace_once ficou duplicada ou ausente.')
+          if fixed.count('def replace_regex(path, pattern, replacement, label, flags=0):') != 1:
+              raise SystemExit('A função replace_regex ficou duplicada ou ausente.')
+
+          # Regressão do erro ocorrido: o texto novo é prefixo do antigo.
+          old_form = 'const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;body.wantsMemberAccount=form.elements.wantsMemberAccount?.checked===true;'
+          new_form = 'const body=Object.fromEntries(new FormData(form));body.privacyAcknowledged=form.elements.privacyAcknowledged.checked;'
+          sample = old_form
+          assert sample.count(old_form) == 1
+          sample = sample.replace(old_form, new_form, 1)
+          assert 'body.wantsMemberAccount' not in sample
+
+          target.write_text(fixed, encoding='utf-8', newline='\n')
+          print('OK replace_once corrigida')
+          print('OK replace_regex corrigida')
+          print('OK regressão do campo wantsMemberAccount validada')
+          print('Workflow original corrigido e salvo.')
+          PY
+
+      - name: Conferir e gravar a correção no GitHub
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TARGET='.github/workflows/star-park-6-mega-atualizacao(1).yml'
+          grep -Fq 'count = source.count(old)' "$TARGET"
+          grep -Fq 'if count == 0:' "$TARGET"
+          grep -Fq 'compiled = re.compile(pattern, flags)' "$TARGET"
+          git diff --check
+          git add -- "$TARGET"
+          if git diff --cached --quiet; then
+            echo 'O workflow original já estava corrigido; nenhum commit adicional foi necessário.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(actions): corrigir substituições do instalador Star Park 6.0.0'
+          git push origin HEAD:main
+          echo 'Correção registrada na branch main.'
